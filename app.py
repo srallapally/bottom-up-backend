@@ -1,3 +1,4 @@
+import logging
 from flask import Flask
 from flask_cors import CORS
 
@@ -7,13 +8,10 @@ from routes.mining import mining_bp
 from routes.recommendations import recommendations_bp
 from routes.over_provisioned import over_provisioned_bp
 
-# V2 routes (hybrid approach)
-try:
-
-    V2_AVAILABLE = True
-except ImportError:
-    V2_AVAILABLE = False
-
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 def create_app():
     app = Flask(__name__)
@@ -31,7 +29,7 @@ def create_app():
         return {
             "status": "ok",
             "v1": "available",
-            "v2": "available" if V2_AVAILABLE else "unavailable (install python-igraph leidenalg)",
+            "v2": "available",
         }
 
     return app

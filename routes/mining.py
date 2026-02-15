@@ -1,12 +1,12 @@
 """
-Mining V2 Routes - Hybrid Role Mining with Daily Reclustering
+Mining Routes - Hybrid Role Mining with Daily Reclustering
 ==============================================================
 
 New endpoints for V2 hybrid approach:
-- POST /api/sessions/<id>/mine-v2              - Initial bootstrap clustering
-- GET  /api/sessions/<id>/config-v2            - Get V2 configuration
-- PUT  /api/sessions/<id>/config-v2            - Update V2 configuration
-- GET  /api/sessions/<id>/results-v2           - Get V2 mining results
+- POST /api/sessions/<id>/mine              - Initial bootstrap clustering
+- GET  /api/sessions/<id>/config            - Get V2 configuration
+- PUT  /api/sessions/<id>/config            - Update V2 configuration
+- GET  /api/sessions/<id>/results           - Get V2 mining results
 - GET  /api/sessions/<id>/draft-roles          - Get draft roles for review
 - POST /api/sessions/<id>/draft-roles/<id>/approve - Approve draft role
 
@@ -31,10 +31,10 @@ from config.config import (
     DEFAULT_MINING_CONFIG,
     get_default_config,
     merge_configs,
-    load_session_config_v2,
-    save_session_config_v2,
-    initialize_v2_session_directories,
-    get_results_v2_path,
+    load_session_config,
+    save_session_config,
+    initialize_session_directories,
+    get_results_path,
 )
 from models.session import (
     get_session_path,
@@ -43,36 +43,20 @@ from models.session import (
     load_dataframe,
 )
 from services.birthright import detect_birthright
-
-# V2 services (to be imported when they exist)
-try:
-    from services.clustering import cluster_entitlements_leiden
-    CLUSTERING_V2_AVAILABLE = True
-except ImportError:
-    CLUSTERING_V2_AVAILABLE = False
-
-try:
-    from services.role_builder import build_roles_v2
-    ROLE_BUILDER_V2_AVAILABLE = True
-except ImportError:
-    ROLE_BUILDER_V2_AVAILABLE = False
+from services.clustering import cluster_entitlements_leiden
+from services.role_builder import build_roles
 
 try:
     from services.confidence_scorer import (
-        score_assignments_v2,
-        generate_recommendations_v2,
-        detect_over_provisioned_v2,
-        build_scoring_summary_v2,
+        score_assignments,
+        generate_recommendations,
+        detect_over_provisioned,
+        build_scoring_summary,
+        save_cluster_assignments,
     )
     CONFIDENCE_SCORER_V2_AVAILABLE = True
 except ImportError:
     CONFIDENCE_SCORER_V2_AVAILABLE = False
-
-# V1 services (reused for some steps)
-from services.confidence_scorer import (
-    build_scoring_summary,
-    save_cluster_assignments,
-)
 
 
 mining_bp = Blueprint("mining", __name__)
@@ -95,7 +79,7 @@ def get_config_v2(session_id):
     except FileNotFoundError:
         return jsonify({"error": "Session not found"}), 404
 
-    config = load_session_config_v2(session_path)
+    config = load_session_config(session_path)
 
     return jsonify(config.to_dict()), 200
 
@@ -129,7 +113,7 @@ def save_config_v2(session_id):
         }), 400
 
     # Save
-    save_session_config_v2(session_path, config)
+    save_session_config(session_path, config)
 
     return jsonify(config.to_dict()), 200
 
@@ -164,22 +148,15 @@ def mine_v2(session_id):
     except FileNotFoundError:
         return jsonify({"error": "Session not found"}), 404
 
-    # Check dependencies
-    if not CLUSTERING_V2_AVAILABLE:
-        return jsonify({
-            "error": "V2 clustering not available",
-            "details": "Install dependencies: pip install python-igraph leidenalg",
-        }), 500
-
     # Check processed data exists
     matrix_path = os.path.join(session_path, "processed", "matrix.csv")
     if not os.path.isfile(matrix_path):
         return jsonify({"error": "No processed data. Call /process first."}), 400
 
     # Initialize V2 directories
-    initialize_v2_session_directories(session_path)
+    initialize_session_directories(session_path)
 
-    logger.info(f"Starting V2 mining for session {session_id}")
+    logger.info(f"Starting mining for session {session_id}")
 
     # Step 1: Load data
     logger.info("Step 1: Loading processed data")
@@ -210,7 +187,7 @@ def mine_v2(session_id):
         }), 400
 
     # Save config for reproducibility
-    save_session_config_v2(session_path, config)
+    save_session_config(session_path, config)
 
     # Flatten per-app birthright dict to namespaced list
     birthright_explicit_flat = []
@@ -260,43 +237,21 @@ def mine_v2(session_id):
 
     # Step 6: Build roles from clusters (V2)
     logger.info("Step 6: Building roles from clusters")
-    if ROLE_BUILDER_V2_AVAILABLE:
-        roles_result = build_roles_v2(
+    roles_result = build_roles(
             matrix=matrix,
             cluster_result=cluster_result,
             birthright_result=birthright_result,
             identities=identities,
             catalog=catalog,
             config=config.to_dict(),
-        )
+    )
 
-        draft_roles = roles_result["roles"]
-        birthright_role = roles_result["birthright_role"]
-        residuals = roles_result["residuals"]
-        multi_cluster_info = roles_result["multi_cluster_info"]
-        naming_summary = roles_result["naming_summary"]
-        summary_base = roles_result["summary"]
-    else:
-        # Fallback to basic implementation
-        draft_roles = _build_draft_roles_from_clusters(
-            cluster_result=cluster_result,
-            matrix=matrix,
-            identities=identities,
-            catalog=catalog,
-            config=config,
-        )
-        birthright_role = _build_birthright_role(
-            birthright_result=birthright_result,
-            catalog=catalog,
-        )
-        residuals = []
-        multi_cluster_info = {}
-        naming_summary = {}
-        summary_base = _build_summary(
-            cluster_result=cluster_result,
-            birthright_result=birthright_result,
-            matrix=matrix,
-        )
+    draft_roles = roles_result["roles"]
+    birthright_role = roles_result["birthright_role"]
+    residuals = roles_result["residuals"]
+    multi_cluster_info = roles_result["multi_cluster_info"]
+    naming_summary = roles_result["naming_summary"]
+    summary_base = roles_result["summary"]
 
     # Step 7: Build results structure
     results = {
@@ -326,7 +281,7 @@ def mine_v2(session_id):
         if CONFIDENCE_SCORER_V2_AVAILABLE:
             try:
                 # Score all assignments with V2 multi-factor confidence
-                enriched_assignments = score_assignments_v2(
+                enriched_assignments = score_assignments(
                     assignments_df=assignments_df,
                     full_matrix=matrix,
                     identities=identities,
@@ -343,7 +298,7 @@ def mine_v2(session_id):
 
                 # Generate recommendations (missing entitlements with high confidence)
                 # TODO: Implement recommendations_v2 properly
-                recommendations = generate_recommendations_v2(
+                recommendations = generate_recommendations(
                     enriched_assignments=enriched_assignments,
                     full_matrix=matrix,
                     cluster_result=cluster_result,
@@ -351,25 +306,25 @@ def mine_v2(session_id):
                 )
 
                 # Detect over-provisioned access (low confidence)
-                over_provisioned = detect_over_provisioned_v2(
+                over_provisioned = detect_over_provisioned(
                     enriched_assignments=enriched_assignments,
                     revocation_threshold=config.revocation_threshold,
                 )
 
-                results_v2_path = get_results_v2_path(session_path)
+                results_path = get_results_path(session_path)
 
                 # Save scoring outputs to results_v2/
                 recommendations.to_csv(
-                    os.path.join(results_v2_path, "recommendations.csv"),
+                    os.path.join(results_path, "recommendations.csv"),
                     index=False
                 )
                 over_provisioned.to_csv(
-                    os.path.join(results_v2_path, "over_provisioned.csv"),
+                    os.path.join(results_path, "over_provisioned.csv"),
                     index=False
                 )
 
                 # Build scoring summary
-                scoring_summary = build_scoring_summary_v2(
+                scoring_summary = build_scoring_summary(
                     enriched_assignments=enriched_assignments,
                     cluster_result=cluster_result,
                     birthright_entitlements=birthright_result["birthright_entitlements"],
@@ -396,20 +351,20 @@ def mine_v2(session_id):
             logger.warning("Confidence scorer V2 not available, skipping")
             results["confidence_scoring"] = {
                 "error": "confidence_scorer_v2 not installed",
-                "message": "Install services/confidence_scorer_v2.py for scoring"
+                "message": "Install services/confidence_scorer.py for scoring"
             }
     else:
         logger.warning("No assignments.csv found, skipping confidence scoring")
 
-    # Step 9: Save results to results_v2/
-    results_v2_path = get_results_v2_path(session_path)
-    save_json(session_id, "results_v2/draft_results.json", results)
+    # Step 9: Save results to results/
+    results_path = get_results_path(session_path)
+    save_json(session_id, "results/draft_results.json", results)
 
     # Save cluster assignments for future drift detection
     # (Store user_cluster_membership for daily comparison)
     save_json(
         session_id,
-        "results_v2/cluster_membership.json",
+        "results/cluster_membership.json",
         cluster_result["user_cluster_membership"],
     )
 
@@ -433,9 +388,9 @@ def get_draft_roles(session_id):
         return jsonify({"error": "Session not found"}), 404
 
     try:
-        draft_results = load_json(session_id, "results_v2/draft_results.json")
+        draft_results = load_json(session_id, "results/draft_results.json")
     except FileNotFoundError:
-        return jsonify({"error": "No draft roles. Run /mine-v2 first."}), 404
+        return jsonify({"error": "No draft roles. Run /mine first."}), 404
 
     return jsonify({
         "roles": draft_results["roles"],
@@ -468,9 +423,9 @@ def approve_draft_role(session_id, role_id):
         return jsonify({"error": "Session not found"}), 404
 
     try:
-        draft_results = load_json(session_id, "results_v2/draft_results.json")
+        draft_results = load_json(session_id, "results/draft_results.json")
     except FileNotFoundError:
-        return jsonify({"error": "No draft roles. Run /mine-v2 first."}), 404
+        return jsonify({"error": "No draft roles. Run /mine first."}), 404
 
     # Find the role
     role = None
@@ -538,9 +493,9 @@ def get_results_v2(session_id):
         return jsonify({"error": "Session not found"}), 404
 
     try:
-        results = load_json(session_id, "results_v2/draft_results.json")
+        results = load_json(session_id, "results/draft_results.json")
     except FileNotFoundError:
-        return jsonify({"error": "No results. Run /mine-v2 first."}), 404
+        return jsonify({"error": "No results. Run /mine first."}), 404
 
     return jsonify(results), 200
 

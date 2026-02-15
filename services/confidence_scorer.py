@@ -73,7 +73,7 @@ def score_assignments(
     Returns:
         Enriched assignments DataFrame with confidence columns
     """
-    logger.info(f"Scoring {len(assignments_df)} assignments with V2 multi-factor confidence")
+    logger.info(f"Scoring {len(assignments_df)} assignments with multi-factor confidence")
 
     # Step 1: Pre-compute attribute prevalence matrices
     logger.info("Step 1: Pre-computing attribute prevalence")
@@ -152,6 +152,7 @@ def _precompute_attribute_prevalence(
     skipped_attributes = []
 
     for attr_name, col_name in attribute_columns.items():
+        logger.info(f"Checking for Attribute column '{col_name}")
         if col_name not in identities.columns:
             logger.warning(f"Attribute column '{col_name}' not found in identities, skipping")
             continue
@@ -172,11 +173,12 @@ def _precompute_attribute_prevalence(
             if len(group_df) < min_group_size:
                 continue
 
-            user_indices = group_df.index
-            total_users = len(user_indices)
+            # user_indices = group_df.index
+            user_ids = group_df["USR_ID"].tolist()
+            total_users = len(user_ids)
 
             # Vectorized: count entitlements per user in this group
-            ent_sums = matrix.loc[user_indices].sum(axis=0)
+            ent_sums = matrix.loc[user_ids].sum(axis=0)
 
             for ent_id, count in ent_sums.items():
                 if count == 0:

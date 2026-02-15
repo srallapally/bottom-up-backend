@@ -82,7 +82,7 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
     "leiden_min_shared_users": 3,  # Minimum users sharing entitlements for edge
 
     # Leiden algorithm parameters
-    "leiden_resolution": 1.0,  # Controls granularity (0.5-2.0)
+    "leiden_resolution": 0.8,  # Controls granularity (0.5-2.0)
                               # Lower = fewer, larger clusters
                               # Higher = more, smaller clusters
     "leiden_random_seed": 42,  # For reproducibility
@@ -176,7 +176,7 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
         "department": "department",
         "job_title": "jobcode",
         "location": "location_country",
-        "manager": "USR_MANAGER_KEY",
+        "manager": "manager",
     },
 
     # Drift stability factor (NEW)
@@ -234,7 +234,7 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
     # =========================================================================
     # LOGGING & MONITORING
     # =========================================================================
-    "log_level": "INFO",  # DEBUG, INFO, WARNING, ERROR
+    "log_level": "DEBUG",  # DEBUG, INFO, WARNING, ERROR
     "enable_performance_logging": True,  # Log timing for each step
     "enable_drift_logging": True,  # Log all drift events
 }
@@ -314,7 +314,7 @@ class MiningConfig:
         "department": "department",
         "job_title": "jobcode",
         "location": "location_country",
-        "manager": "USR_MANAGER_KEY",
+        "manager": "manager",
     })
     use_drift_stability_factor: bool = True
     drift_stability_weight: float = 0.1
@@ -357,7 +357,7 @@ class MiningConfig:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> 'MiningConfigV2':
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'MiningConfig':
         """Create from dictionary, ignoring unknown keys."""
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in config_dict.items() if k in valid_keys}
@@ -471,7 +471,7 @@ CONSERVATIVE_CONFIG = {
 # Aggressive preset (more, smaller roles)
 AGGRESSIVE_CONFIG = {
     "leiden_min_similarity": 0.25,  # Lower = more edges
-    "leiden_resolution": 1.5,  # Higher = smaller clusters
+    "leiden_resolution": 0.8,  # Higher = smaller clusters
     "min_entitlement_coverage": 0.4,  # Lower coverage accepted
     "max_clusters_per_user": 7,  # Allow more multi-membership
     "drift_auto_approve_threshold": 0.15,  # Higher drift auto-approved
@@ -511,7 +511,7 @@ def get_preset_config(preset: str) -> Dict[str, Any]:
 # SESSION-BASED FILE I/O (integrates with existing session.py)
 # ============================================================================
 
-def load_session_config_v2(session_path: str) -> MiningConfig:
+def load_session_config(session_path: str) -> MiningConfig:
     """
     Load V2 configuration from session directory.
 
@@ -524,26 +524,17 @@ def load_session_config_v2(session_path: str) -> MiningConfig:
         MiningConfigV2 instance
     """
     # Try V2-specific config first
-    v2_config_path = os.path.join(session_path, "config_v2.json")
-    if os.path.isfile(v2_config_path):
-        with open(v2_config_path, 'r') as f:
+    config_path = os.path.join(session_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, 'r') as f:
             config_dict = json.load(f)
         return MiningConfig.from_dict(config_dict)
-
-    # Fall back to V1 config (for backward compatibility)
-    v1_config_path = os.path.join(session_path, "config.json")
-    if os.path.isfile(v1_config_path):
-        with open(v1_config_path, 'r') as f:
-            v1_config = json.load(f)
-        # Merge V1 config into V2 defaults
-        merged = merge_configs(DEFAULT_MINING_CONFIG, v1_config)
-        return MiningConfig.from_dict(merged)
 
     # No config found, use defaults
     return get_default_config()
 
 
-def save_session_config_v2(session_path: str, config: MiningConfig) -> None:
+def save_session_config(session_path: str, config: MiningConfig) -> None:
     """
     Save V2 configuration to session directory.
 
@@ -553,12 +544,12 @@ def save_session_config_v2(session_path: str, config: MiningConfig) -> None:
         session_path: Path to session directory
         config: Configuration to save
     """
-    config_path = os.path.join(session_path, "config_v2.json")
+    config_path = os.path.join(session_path, "config.json")
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
 
 
-def get_results_v2_path(session_path: str) -> str:
+def get_results_path(session_path: str) -> str:
     """
     Get path to V2 results directory.
 
@@ -571,12 +562,12 @@ def get_results_v2_path(session_path: str) -> str:
     Returns:
         Path to results_v2 directory (creates if needed)
     """
-    results_path = os.path.join(session_path, "results_v2")
+    results_path = os.path.join(session_path, "results")
     os.makedirs(results_path, exist_ok=True)
     return results_path
 
 
-def initialize_v2_session_directories(session_path: str) -> None:
+def initialize_session_directories(session_path: str) -> None:
     """
     Create V2-specific directories in session.
 
@@ -589,7 +580,7 @@ def initialize_v2_session_directories(session_path: str) -> None:
     Args:
         session_path: Path to session directory
     """
-    os.makedirs(os.path.join(session_path, "results_v2"), exist_ok=True)
+    os.makedirs(os.path.join(session_path, "results"), exist_ok=True)
     os.makedirs(os.path.join(session_path, "business_roles"), exist_ok=True)
     os.makedirs(os.path.join(session_path, "peer_clusters"), exist_ok=True)
     os.makedirs(os.path.join(session_path, "drift_reports"), exist_ok=True)

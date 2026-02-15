@@ -367,11 +367,11 @@ def _run_leiden_clustering(
     # Run Leiden
     partition = leidenalg.find_partition(
         g,
-        leidenalg.ModularityVertexPartition,
+        leidenalg.CPMVertexPartition,
         weights='weight',
-        resolution_parameter=resolution,
+        resolution_parameter=resolution,  # CPM supports this
         seed=random_seed,
-        n_iterations=-1,  # Run until convergence
+        n_iterations=-1,
     )
 
     # Extract clusters

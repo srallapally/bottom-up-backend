@@ -3,9 +3,11 @@ import os
 import uuid
 
 import pandas as pd
+import logging
+
 
 from config.config import BASE_DATA_DIR
-
+logger = logging.getLogger(__name__)
 
 def create_session() -> str:
     session_id = str(uuid.uuid4())
@@ -61,6 +63,7 @@ def list_sessions() -> list[dict]:
 
 def get_session_path(session_id: str) -> str:
     session_path = os.path.join(BASE_DATA_DIR, session_id)
+    logger.info(f"Session path: {session_path}")
     if not os.path.isdir(session_path):
         raise FileNotFoundError(f"Session {session_id} not found")
     return session_path
@@ -89,4 +92,8 @@ def save_dataframe(session_id: str, filename: str, df: pd.DataFrame) -> None:
 def load_dataframe(session_id: str, filename: str) -> pd.DataFrame:
     session_path = get_session_path(session_id)
     filepath = os.path.join(session_path, filename)
-    return pd.read_csv(filepath, index_col=0)
+    if 'matrix.csv' in filename:
+        return pd.read_csv(filepath, index_col=0)
+    else:
+        return pd.read_csv(filepath)
+    # return pd.read_csv(filepath, index_col=0)

@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # MAIN ROLE BUILDING FUNCTION
 # ============================================================================
 
-def build_roles_v2(
+def build_roles(
         matrix: pd.DataFrame,
         cluster_result: Dict[str, Any],
         birthright_result: Dict[str, Any],
@@ -395,12 +395,10 @@ def _summarize_hr_attributes(members: List[str], identities: pd.DataFrame) -> Di
 
     Returns top 3 values per attribute with counts and percentages.
     """
-    member_ids = [m for m in members if m in identities.index]
-    if not member_ids:
+    # Filter identities to only members (USR_ID is a column, not index)
+    member_data = identities[identities['USR_ID'].isin(members)]
+    if member_data.empty:
         return {}
-
-    member_data = identities.loc[member_ids]
-
     hr_cols = [
         "department",
         "business_unit",
@@ -452,12 +450,25 @@ def _enrich_entitlements(
     if catalog is not None and not catalog.empty:
         # Build lookup
         catalog_lookup = {}
-        for _, row in catalog.iterrows():
-            catalog_lookup[row["namespaced_id"]] = {
-                "app_id": str(row["APP_ID"]),
-                "ent_name": str(row.get("ENT_NAME", row["ENT_ID"])),
-            }
+        print(f"DEBUG: Catalog shape: {catalog.shape}")
+        print(f"DEBUG: Catalog columns: {list(catalog.columns)}")
+        print(f"DEBUG: Catalog index type: {type(catalog.index)}")
+        row_count = 0
+        for idx, row in catalog.iterrows():
+           row_count += 1
+           try:
+                catalog_lookup[row["namespaced_id"]] = {
+                    "app_id": str(row["APP_ID"]),
+                    "ent_name": str(row.get("ENT_NAME", row["ENT_ID"])),
+                }
+           except KeyError as e:
+                print(f"ERROR at row {idx}:")
+                print(f"  KeyError: {e}")
+                print(f"  Row index: {row.index.tolist()}")
+                print(f"  Row values: {row.tolist()}")
+                raise
 
+        print(f"DEBUG: Successfully processed {row_count} catalog rows")
         # Enrich
         enriched = []
         for ent_id in entitlement_ids:
