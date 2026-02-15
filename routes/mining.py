@@ -15,9 +15,13 @@ V1 endpoints remain unchanged in routes/mining.py
 
 import os
 import sys
+import logging
 from typing import Dict, Any
 
 from flask import Blueprint, request, jsonify
+
+
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,16 +46,34 @@ from services.birthright import detect_birthright
 
 # V2 services (to be imported when they exist)
 try:
-    from services.entitlement_clustering_v2 import cluster_entitlements_leiden
+    from services.clustering import cluster_entitlements_leiden
     CLUSTERING_V2_AVAILABLE = True
 except ImportError:
     CLUSTERING_V2_AVAILABLE = False
 
 try:
-    from services.role_builder import build_roles_v2
+    from services.role_builder_v2 import build_roles_v2
     ROLE_BUILDER_V2_AVAILABLE = True
 except ImportError:
     ROLE_BUILDER_V2_AVAILABLE = False
+
+try:
+    from services.confidence_scorer_v2 import (
+        score_assignments_v2,
+        generate_recommendations_v2,
+        detect_over_provisioned_v2,
+        build_scoring_summary_v2,
+    )
+    CONFIDENCE_SCORER_V2_AVAILABLE = True
+except ImportError:
+    CONFIDENCE_SCORER_V2_AVAILABLE = False
+
+# V1 services (reused for some steps)
+from services.confidence_scorer import (
+    build_scoring_summary,
+    save_cluster_assignments,
+)
+
 
 mining_bp = Blueprint("mining", __name__)
 
@@ -157,7 +179,10 @@ def mine_v2(session_id):
     # Initialize V2 directories
     initialize_v2_session_directories(session_path)
 
+    logger.info(f"Starting V2 mining for session {session_id}")
+
     # Step 1: Load data
+    logger.info("Step 1: Loading processed data")
     matrix = load_dataframe(session_id, "processed/matrix.csv")
     identities = load_dataframe(session_id, "processed/identities.csv")
 
@@ -165,13 +190,18 @@ def mine_v2(session_id):
     catalog_path = os.path.join(session_path, "processed", "catalog.csv")
     if os.path.isfile(catalog_path):
         catalog = load_dataframe(session_id, "processed/catalog.csv")
+        logger.info(f"Loaded catalog with {len(catalog)} entitlements")
+
+    logger.info(f"Loaded matrix: {matrix.shape[0]} users × {matrix.shape[1]} entitlements")
 
     # Step 2: Merge config (defaults + request body)
+    logger.info("Step 2: Merging configuration")
     request_body = request.get_json(silent=True) or {}
     config_dict = merge_configs(DEFAULT_MINING_CONFIG, request_body)
     config = MiningConfig.from_dict(config_dict)
 
     # Step 3: Validate config
+    logger.info("Step 3: Validating configuration")
     validation_errors = config.validate()
     if validation_errors:
         return jsonify({
@@ -189,6 +219,7 @@ def mine_v2(session_id):
             birthright_explicit_flat.append(f"{app_name}:{eid}")
 
     # Step 4: Birthright detection (reuse V1)
+    logger.info("Step 4: Detecting birthright entitlements")
     birthright_result = detect_birthright(
         matrix=matrix,
         threshold=config.birthright_threshold,
@@ -196,7 +227,14 @@ def mine_v2(session_id):
         min_assignment_count=config.min_assignment_count,
     )
 
+    logger.info(
+        f"Birthright detection complete: "
+        f"{len(birthright_result['birthright_entitlements'])} birthright, "
+        f"{len(birthright_result.get('noise_entitlements', []))} noise"
+    )
+
     # Step 5: Entitlement clustering (V2 - Leiden)
+    logger.info("Step 5: Running Leiden clustering")
     try:
         cluster_result = cluster_entitlements_leiden(
             matrix=birthright_result["filtered_matrix"],
@@ -215,7 +253,13 @@ def mine_v2(session_id):
             "details": str(e),
         }), 500
 
+    logger.info(
+        f"Leiden clustering complete: {cluster_result['n_clusters']} clusters, "
+        f"modularity={cluster_result['leiden_stats']['modularity']:.3f}"
+    )
+
     # Step 6: Build roles from clusters (V2)
+    logger.info("Step 6: Building roles from clusters")
     if ROLE_BUILDER_V2_AVAILABLE:
         roles_result = build_roles_v2(
             matrix=matrix,
@@ -271,7 +315,93 @@ def mine_v2(session_id):
         "status": "draft",  # Not yet approved by stakeholders
     }
 
-    # Save results to results_v2/
+    # Step 8: Confidence Scoring (V2 - Multi-factor)
+    logger.info("Step 8: Computing multi-factor confidence scores")
+
+    # Load assignments
+    assignments_path = os.path.join(session_path, "processed", "assignments.csv")
+    if os.path.isfile(assignments_path):
+        assignments_df = load_dataframe(session_id, "processed/assignments.csv").reset_index(drop=True)
+
+        if CONFIDENCE_SCORER_V2_AVAILABLE:
+            try:
+                # Score all assignments with V2 multi-factor confidence
+                enriched_assignments = score_assignments_v2(
+                    assignments_df=assignments_df,
+                    full_matrix=matrix,
+                    identities=identities,
+                    cluster_result=cluster_result,
+                    roles=draft_roles,
+                    birthright_entitlements=birthright_result["birthright_entitlements"],
+                    noise_entitlements=birthright_result.get("noise_entitlements", []),
+                    config=config.to_dict(),
+                    drift_data=None,  # TODO: Load from daily clustering when available
+                )
+
+                # Save enriched assignments
+                enriched_assignments.to_csv(assignments_path, index=False)
+
+                # Generate recommendations (missing entitlements with high confidence)
+                # TODO: Implement recommendations_v2 properly
+                recommendations = generate_recommendations_v2(
+                    enriched_assignments=enriched_assignments,
+                    full_matrix=matrix,
+                    cluster_result=cluster_result,
+                    config=config.to_dict(),
+                )
+
+                # Detect over-provisioned access (low confidence)
+                over_provisioned = detect_over_provisioned_v2(
+                    enriched_assignments=enriched_assignments,
+                    revocation_threshold=config.revocation_threshold,
+                )
+
+                results_v2_path = get_results_v2_path(session_path)
+
+                # Save scoring outputs to results_v2/
+                recommendations.to_csv(
+                    os.path.join(results_v2_path, "recommendations.csv"),
+                    index=False
+                )
+                over_provisioned.to_csv(
+                    os.path.join(results_v2_path, "over_provisioned.csv"),
+                    index=False
+                )
+
+                # Build scoring summary
+                scoring_summary = build_scoring_summary_v2(
+                    enriched_assignments=enriched_assignments,
+                    cluster_result=cluster_result,
+                    birthright_entitlements=birthright_result["birthright_entitlements"],
+                )
+
+                # Add to results
+                results.update(scoring_summary)
+
+                logger.info(
+                    f"Confidence scoring complete: "
+                    f"{scoring_summary['confidence_scoring']['high']} HIGH, "
+                    f"{scoring_summary['confidence_scoring']['medium']} MEDIUM, "
+                    f"{scoring_summary['confidence_scoring']['low']} LOW"
+                )
+
+            except Exception as e:
+                logger.error(f"Confidence scoring failed: {e}", exc_info=True)
+                # Continue without scoring
+                results["confidence_scoring"] = {
+                    "error": str(e),
+                    "message": "Confidence scoring failed, results available without scoring"
+                }
+        else:
+            logger.warning("Confidence scorer V2 not available, skipping")
+            results["confidence_scoring"] = {
+                "error": "confidence_scorer_v2 not installed",
+                "message": "Install services/confidence_scorer_v2.py for scoring"
+            }
+    else:
+        logger.warning("No assignments.csv found, skipping confidence scoring")
+
+    # Step 9: Save results to results_v2/
     results_v2_path = get_results_v2_path(session_path)
     save_json(session_id, "results_v2/draft_results.json", results)
 
@@ -290,7 +420,7 @@ def mine_v2(session_id):
 # DRAFT ROLE MANAGEMENT
 # ============================================================================
 
-@mining_bp.route("/api/sessions/<session_id>/draft-roles", methods=["GET"])
+@mining_v2_bp.route("/api/sessions/<session_id>/draft-roles", methods=["GET"])
 def get_draft_roles(session_id):
     """
     GET /api/sessions/<id>/draft-roles
@@ -314,7 +444,7 @@ def get_draft_roles(session_id):
     }), 200
 
 
-@mining_bp.route("/api/sessions/<session_id>/draft-roles/<role_id>/approve", methods=["POST"])
+@mining_v2_bp.route("/api/sessions/<session_id>/draft-roles/<role_id>/approve", methods=["POST"])
 def approve_draft_role(session_id, role_id):
     """
     POST /api/sessions/<id>/draft-roles/<role_id>/approve
@@ -395,7 +525,7 @@ def approve_draft_role(session_id, role_id):
 # RESULTS RETRIEVAL
 # ============================================================================
 
-@mining_bp.route("/api/sessions/<session_id>/results", methods=["GET"])
+@mining_v2_bp.route("/api/sessions/<session_id>/results-v2", methods=["GET"])
 def get_results_v2(session_id):
     """
     GET /api/sessions/<id>/results-v2
@@ -424,7 +554,7 @@ def _build_draft_roles_from_clusters(
     matrix,
     identities,
     catalog,
-    config: MiningConfig,
+    config: MiningConfigV2,
 ) -> list:
     """
     Build draft roles from entitlement clusters.
@@ -521,7 +651,7 @@ def _generate_role_name(
     members: list,
     identities,
     cluster_id: int,
-    config: MiningConfig,
+    config: MiningConfigV2,
 ) -> str:
     """
     Auto-generate role name from HR attribute dominance.
