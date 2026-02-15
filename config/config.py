@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, asdict
 import json
 import os
 
-BASE_DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "sessions")
+BASE_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "sessions")
 
 # ============================================================================
 # CONFIGURATION VALIDATION RULES

@@ -2,14 +2,14 @@ from flask import Flask
 from flask_cors import CORS
 
 from routes.upload import upload_bp
-from routes.mining import mining_bp
 from routes.export import export_bp
+from routes.mining import mining_bp
 from routes.recommendations import recommendations_bp
 from routes.over_provisioned import over_provisioned_bp
 
 # V2 routes (hybrid approach)
 try:
-    from routes.mining import mining_bp
+
     V2_AVAILABLE = True
 except ImportError:
     V2_AVAILABLE = False
