@@ -4,7 +4,7 @@ import uuid
 
 import pandas as pd
 
-from config import BASE_DATA_DIR
+from config.config import BASE_DATA_DIR
 
 
 def create_session() -> str:

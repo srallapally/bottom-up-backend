@@ -26,10 +26,6 @@ def create_app():
     app.register_blueprint(recommendations_bp)
     app.register_blueprint(over_provisioned_bp)
 
-    # V2 blueprints (new)
-    if V2_AVAILABLE:
-        app.register_blueprint(mining_bp)
-
     @app.route("/api/health", methods=["GET"])
     def health():
         return {
