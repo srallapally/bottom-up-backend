@@ -52,13 +52,13 @@ except ImportError:
     CLUSTERING_V2_AVAILABLE = False
 
 try:
-    from services.role_builder_v2 import build_roles_v2
+    from services.role_builder import build_roles_v2
     ROLE_BUILDER_V2_AVAILABLE = True
 except ImportError:
     ROLE_BUILDER_V2_AVAILABLE = False
 
 try:
-    from services.confidence_scorer_v2 import (
+    from services.confidence_scorer import (
         score_assignments_v2,
         generate_recommendations_v2,
         detect_over_provisioned_v2,
@@ -420,7 +420,7 @@ def mine_v2(session_id):
 # DRAFT ROLE MANAGEMENT
 # ============================================================================
 
-@mining_v2_bp.route("/api/sessions/<session_id>/draft-roles", methods=["GET"])
+@mining_bp.route("/api/sessions/<session_id>/draft-roles", methods=["GET"])
 def get_draft_roles(session_id):
     """
     GET /api/sessions/<id>/draft-roles
@@ -444,7 +444,7 @@ def get_draft_roles(session_id):
     }), 200
 
 
-@mining_v2_bp.route("/api/sessions/<session_id>/draft-roles/<role_id>/approve", methods=["POST"])
+@mining_bp.route("/api/sessions/<session_id>/draft-roles/<role_id>/approve", methods=["POST"])
 def approve_draft_role(session_id, role_id):
     """
     POST /api/sessions/<id>/draft-roles/<role_id>/approve
@@ -525,7 +525,7 @@ def approve_draft_role(session_id, role_id):
 # RESULTS RETRIEVAL
 # ============================================================================
 
-@mining_v2_bp.route("/api/sessions/<session_id>/results-v2", methods=["GET"])
+@mining_bp.route("/api/sessions/<session_id>/results", methods=["GET"])
 def get_results_v2(session_id):
     """
     GET /api/sessions/<id>/results-v2
@@ -554,7 +554,7 @@ def _build_draft_roles_from_clusters(
     matrix,
     identities,
     catalog,
-    config: MiningConfigV2,
+    config: MiningConfig,
 ) -> list:
     """
     Build draft roles from entitlement clusters.
@@ -651,7 +651,7 @@ def _generate_role_name(
     members: list,
     identities,
     cluster_id: int,
-    config: MiningConfigV2,
+    config: MiningConfig,
 ) -> str:
     """
     Auto-generate role name from HR attribute dominance.
