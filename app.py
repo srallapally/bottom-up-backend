@@ -7,9 +7,10 @@ from routes.export import export_bp
 from routes.mining import mining_bp
 from routes.recommendations import recommendations_bp
 from routes.over_provisioned import over_provisioned_bp
+from routes.assignments import assignments_bp
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
@@ -24,6 +25,8 @@ def create_app():
     app.register_blueprint(recommendations_bp)
     app.register_blueprint(over_provisioned_bp)
 
+    app.register_blueprint(assignments_bp)
+    print(f"Registered routes: {[rule.rule for rule in app.url_map.iter_rules()]}")
     @app.route("/api/health", methods=["GET"])
     def health():
         return {
@@ -37,4 +40,4 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000,host='0.0.0.0')

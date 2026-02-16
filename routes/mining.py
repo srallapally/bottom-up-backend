@@ -294,8 +294,12 @@ def mine_v2(session_id):
                 )
 
                 # Save enriched assignments
-                enriched_assignments.to_csv(assignments_path, index=False)
-
+                # enriched_assignments.to_csv(assignments_path, index=False)
+                results_path = get_results_path(session_path)
+                enriched_assignments.to_csv(
+                    os.path.join(results_path, "assignments_scored.csv"),
+                    index=False
+                )
                 # Generate recommendations (missing entitlements with high confidence)
                 # TODO: Implement recommendations_v2 properly
                 recommendations = generate_recommendations(
@@ -311,7 +315,7 @@ def mine_v2(session_id):
                     revocation_threshold=config.revocation_threshold,
                 )
 
-                results_path = get_results_path(session_path)
+                # results_path = get_results_path(session_path)
 
                 # Save scoring outputs to results_v2/
                 recommendations.to_csv(

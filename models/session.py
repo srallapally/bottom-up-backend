@@ -54,6 +54,7 @@ def list_sessions() -> list[dict]:
             "has_results": has_results,
             "total_users": stats.get("total_users"),
             "total_entitlements": stats.get("total_entitlements"),
+            "total_assignments": stats.get("total_assignments"),
             "apps": stats.get("apps"),
         })
 
