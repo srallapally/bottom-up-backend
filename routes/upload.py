@@ -1,3 +1,4 @@
+import json
 import os
 
 from flask import Blueprint, request, jsonify
@@ -61,3 +62,44 @@ def process_files(session_id):
 
     save_json(session_id, "processed/stats.json", stats)
     return jsonify({"session_id": session_id, "stats": stats}), 200
+
+
+@upload_bp.route("/api/sessions/<session_id>/status", methods=["GET"])
+def session_status(session_id):
+    try:
+        session_path = get_session_path(session_id)
+    except FileNotFoundError:
+        return jsonify({"error": "Session not found"}), 404
+
+    uploads_dir = os.path.join(session_path, "uploads")
+    uploaded_files = {
+        ft: os.path.isfile(os.path.join(uploads_dir, f"{ft}.csv"))
+        for ft in ("identities", "assignments", "entitlements")
+    }
+
+    # Processed stats
+    stats = None
+    stats_path = os.path.join(session_path, "processed", "stats.json")
+    if os.path.isfile(stats_path):
+        try:
+            with open(stats_path) as f:
+                stats = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Config saved?
+    has_config = os.path.isfile(os.path.join(session_path, "config.json"))
+
+    # Mining results exist?
+    has_results = os.path.isfile(
+        os.path.join(session_path, "results", "draft_results.json")
+    )
+
+    return jsonify({
+        "session_id": session_id,
+        "uploaded_files": uploaded_files,
+        "has_processed": stats is not None,
+        "stats": stats,
+        "has_config": has_config,
+        "has_results": has_results,
+    }), 200

@@ -49,6 +49,10 @@ VALIDATION_RULES = {
         "max": 10,
         "warning_high": "Max > 5 may indicate noisy assignments",
     },
+    "min_entitlements_per_role": {
+        "min": 2,
+        "error": "Must be >= 2 (single-entitlement roles are not meaningful)",
+    },
     "drift_auto_approve_threshold": {
         "min": 0.0,
         "max": 0.3,
@@ -93,6 +97,7 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
 
     # Cluster filtering
     "min_role_size": 10,  # Drop clusters with < 10 users
+    "min_entitlements_per_role": 2,  # Drop clusters with < 2 entitlements
 
     # =========================================================================
     # BUSINESS ROLE MANAGEMENT (New for Hybrid)
@@ -266,6 +271,7 @@ class MiningConfig:
     min_entitlement_coverage: float = 0.5
     max_clusters_per_user: int = 5
     min_role_size: int = 10
+    min_entitlements_per_role: int = 2
 
     # Business role management
     auto_generate_role_names: bool = True
@@ -410,6 +416,11 @@ class MiningConfig:
             errors.append(f"max_clusters_per_user < {rule['min']}")
         if self.max_clusters_per_user > rule["max"]:
             errors.append(f"max_clusters_per_user > {rule['max']}: {rule.get('warning_high', 'Too many')}")
+
+        # Min entitlements per role
+        rule = VALIDATION_RULES["min_entitlements_per_role"]
+        if self.min_entitlements_per_role < rule["min"]:
+            errors.append(f"min_entitlements_per_role < {rule['min']}: {rule['error']}")
 
         # Drift auto-approve threshold
         rule = VALIDATION_RULES["drift_auto_approve_threshold"]

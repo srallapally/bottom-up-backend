@@ -69,11 +69,46 @@ def build_roles(
     user_memberships = cluster_result["user_cluster_membership"]
     cluster_metadata = cluster_result["cluster_metadata"]
 
-    # Step 1: Build role per cluster
-    logger.info(f"Step 1: Building {len(entitlement_clusters)} roles from clusters")
+    # Step 1: Build role per cluster (with filtering)
+    min_entitlements = config.get("min_entitlements_per_role", 2)
+    logger.info(f"Step 1: Building roles from {len(entitlement_clusters)} clusters "
+                f"(min_entitlements={min_entitlements})")
     roles = []
+    filtered_clusters = {"low_entitlements": 0, "zero_members": 0, "details": []}
 
     for cluster_id in sorted(entitlement_clusters.keys()):
+        cluster_ents = entitlement_clusters[cluster_id]
+
+        # Filter: too few entitlements
+        if len(cluster_ents) < min_entitlements:
+            filtered_clusters["low_entitlements"] += 1
+            filtered_clusters["details"].append({
+                "cluster_id": cluster_id,
+                "reason": "low_entitlements",
+                "entitlement_count": len(cluster_ents),
+                "entitlements": cluster_ents,
+            })
+            logger.debug(
+                f"Skipping cluster {cluster_id}: "
+                f"{len(cluster_ents)} entitlement(s) < min {min_entitlements}"
+            )
+            continue
+
+        # Filter: zero members (no users qualified for this cluster)
+        has_members = any(
+            any(m["cluster_id"] == cluster_id for m in memberships)
+            for memberships in user_memberships.values()
+        )
+        if not has_members:
+            filtered_clusters["zero_members"] += 1
+            filtered_clusters["details"].append({
+                "cluster_id": cluster_id,
+                "reason": "zero_members",
+                "entitlement_count": len(cluster_ents),
+            })
+            logger.debug(f"Skipping cluster {cluster_id}: 0 members")
+            continue
+
         role = _build_role_from_cluster(
             cluster_id=cluster_id,
             cluster_entitlements=entitlement_clusters[cluster_id],
@@ -121,8 +156,17 @@ def build_roles(
         matrix=matrix,
     )
 
+    total_filtered = filtered_clusters["low_entitlements"] + filtered_clusters["zero_members"]
+    if total_filtered > 0:
+        logger.info(
+            f"Filtered {total_filtered} clusters: "
+            f"{filtered_clusters['low_entitlements']} low-entitlement, "
+            f"{filtered_clusters['zero_members']} zero-member"
+        )
+
     logger.info(
-        f"Role building complete: {len(roles)} roles, "
+        f"Role building complete: {len(roles)} roles "
+        f"(from {len(entitlement_clusters)} clusters, {total_filtered} filtered), "
         f"{summary['assigned_users']}/{summary['total_users']} users assigned"
     )
 
@@ -134,6 +178,7 @@ def build_roles(
         "multi_cluster_info": multi_cluster_info,
         "naming_summary": naming_summary,
         "noise_entitlements": birthright_result.get("noise_entitlements", []),
+        "filtered_clusters": filtered_clusters,
     }
 
 

@@ -8,6 +8,7 @@ from routes.mining import mining_bp
 from routes.recommendations import recommendations_bp
 from routes.over_provisioned import over_provisioned_bp
 from routes.assignments import assignments_bp
+from routes.browse import browse_bp
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -26,6 +27,8 @@ def create_app():
     app.register_blueprint(over_provisioned_bp)
 
     app.register_blueprint(assignments_bp)
+
+    app.register_blueprint(browse_bp)
     print(f"Registered routes: {[rule.rule for rule in app.url_map.iter_rules()]}")
     @app.route("/api/health", methods=["GET"])
     def health():
