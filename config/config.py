@@ -214,9 +214,13 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
     "birthright_promotion_threshold": 0.50,     # core in > 50% of roles = flag for birthright
     "role_merge_similarity_threshold": 0.70,    # Jaccard > 0.70 of core sets = merge candidate
 
+    # Peer group weight (base weight before attribute scaling)
+    # Attribute weights are scaled into (1.0 - peer_group_weight - extra_factor_weights)
+    "peer_group_weight": 0.40,
+
     # Drift stability factor (NEW)
-    "use_drift_stability_factor": True,
-    "drift_stability_weight": 0.1,  # Add 10% weight for stable entitlements
+    "use_drift_stability_factor": False,  # Stub returns 1.0 always - enable when drift_detector is implemented
+    "drift_stability_weight": 0.0,  # Zero until drift_stability_factor is implemented
     "drift_stability_window_days": 7,  # Stable = unchanged for 7+ days
 
     # Role coverage factor (NEW)
@@ -344,8 +348,9 @@ class MiningConfig:
     entitlement_association_threshold: float = 0.40
     birthright_promotion_threshold: float = 0.50
     role_merge_similarity_threshold: float = 0.70
-    use_drift_stability_factor: bool = True
-    drift_stability_weight: float = 0.1
+    use_drift_stability_factor: bool = False
+    peer_group_weight: float = 0.40
+    drift_stability_weight: float = 0.0
     drift_stability_window_days: int = 7
     use_role_coverage_factor: bool = True
     role_coverage_weight: float = 0.1

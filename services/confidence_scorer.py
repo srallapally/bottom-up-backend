@@ -662,7 +662,7 @@ def _compute_weighted_confidence(
     #
     # Strategy: peer_group = 0.40, extra factors take their configured weight,
     # attribute weights are scaled to fill (1.0 - 0.40 - extra_weights)
-    peer_group_base_weight = 0.40
+    peer_group_base_weight = config.get("peer_group_weight", 0.40)
     extra_weight_total = drift_weight + role_cov_weight
     attr_budget = max(0.0, 1.0 - peer_group_base_weight - extra_weight_total)
 
