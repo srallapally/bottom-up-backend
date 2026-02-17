@@ -1,3 +1,4 @@
+# routes/mining.py
 """
 Mining Routes - Hybrid Role Mining with Daily Reclustering
 ==============================================================
@@ -186,6 +187,17 @@ def mine_v2(session_id):
             "validation_errors": validation_errors,
         }), 400
 
+    # ADDED: Validate that configured user_attributes columns exist in identities.csv
+    # Hard fail if any column is missing — customer must fix config before mining.
+    data_validation_errors = config.validate_against_data(
+        identities_columns=list(identities.columns)
+    )
+    if data_validation_errors:
+        return jsonify({
+            "error": "Mining configuration error: attribute columns not found in data",
+            "validation_errors": data_validation_errors,
+        }), 400
+
     # Save config for reproducibility
     save_session_config(session_path, config)
 
@@ -220,6 +232,7 @@ def mine_v2(session_id):
             leiden_resolution=config.leiden_resolution,
             leiden_random_seed=config.leiden_random_seed,
             min_entitlement_coverage=config.min_entitlement_coverage,
+            min_absolute_overlap=config.min_absolute_overlap,
             max_clusters_per_user=config.max_clusters_per_user,
             min_role_size=config.min_role_size,
             use_sparse=config.use_sparse_matrices,
@@ -252,11 +265,15 @@ def mine_v2(session_id):
     multi_cluster_info = roles_result["multi_cluster_info"]
     naming_summary = roles_result["naming_summary"]
     summary_base = roles_result["summary"]
+    birthright_promotions = roles_result.get("birthright_promotions", [])
+    merge_candidates = roles_result.get("merge_candidates", [])
 
     # Step 7: Build results structure
     results = {
         "roles": draft_roles,
         "birthright_role": birthright_role,
+        "birthright_promotions": birthright_promotions,
+        "merge_candidates": merge_candidates,
         "residuals": residuals,
         "cluster_info": {
             "leiden_stats": cluster_result["leiden_stats"],
@@ -507,223 +524,11 @@ def get_results_v2(session_id):
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
-
-def _build_draft_roles_from_clusters(
-    cluster_result: Dict[str, Any],
-    matrix,
-    identities,
-    catalog,
-    config: MiningConfig,
-) -> list:
-    """
-    Build draft roles from entitlement clusters.
-
-    TODO: Replace with role_builder_v2.py when implemented.
-    This is a simplified version for now.
-    """
-    entitlement_clusters = cluster_result["entitlement_clusters"]
-    user_memberships = cluster_result["user_cluster_membership"]
-    cluster_metadata = cluster_result["cluster_metadata"]
-
-    roles = []
-
-    for cluster_id, cluster_ents in entitlement_clusters.items():
-        # Find users in this cluster
-        members = [
-            user_id for user_id, memberships in user_memberships.items()
-            if any(m["cluster_id"] == cluster_id for m in memberships)
-        ]
-
-        # Get coverage for each member
-        member_coverage = {}
-        for user_id in members:
-            for m in user_memberships[user_id]:
-                if m["cluster_id"] == cluster_id:
-                    member_coverage[user_id] = {
-                        "coverage": m["coverage"],
-                        "has_count": m["count"],
-                        "total_count": m["total"],
-                    }
-                    break
-
-        # Auto-generate role name from HR attributes
-        role_name = _generate_role_name(
-            members=members,
-            identities=identities,
-            cluster_id=cluster_id,
-            config=config,
-        )
-
-        # Get HR summary
-        hr_summary = _summarize_hr_attributes(members, identities)
-
-        # Enrich with catalog
-        entitlements_detail = []
-        if catalog is not None:
-            catalog_lookup = {
-                row["namespaced_id"]: {
-                    "app_id": row["APP_ID"],
-                    "ent_name": row.get("ENT_NAME", row["ENT_ID"]),
-                }
-                for _, row in catalog.iterrows()
-            }
-
-            for ent_id in cluster_ents:
-                detail = catalog_lookup.get(ent_id, {})
-                entitlements_detail.append({
-                    "entitlement_id": ent_id,
-                    "app_id": detail.get("app_id", ent_id.split(":")[0]),
-                    "ent_name": detail.get("ent_name", ent_id.split(":")[-1]),
-                })
-        else:
-            for ent_id in cluster_ents:
-                parts = ent_id.split(":", 1)
-                entitlements_detail.append({
-                    "entitlement_id": ent_id,
-                    "app_id": parts[0] if len(parts) == 2 else "",
-                    "ent_name": parts[1] if len(parts) == 2 else ent_id,
-                })
-
-        meta = cluster_metadata.get(cluster_id, {})
-
-        role = {
-            "role_id": f"ROLE_{cluster_id:03d}",
-            "role_name": role_name,
-            "entitlement_cluster_id": cluster_id,
-            "entitlements": cluster_ents,
-            "entitlement_count": len(cluster_ents),
-            "members": members,
-            "member_count": len(members),
-            "member_coverage": member_coverage,
-            "avg_coverage": meta.get("avg_coverage", 0.0),
-            "hr_summary": hr_summary,
-            "entitlements_detail": entitlements_detail,
-            "status": "draft",
-        }
-
-        roles.append(role)
-
-    return roles
-
-
-def _generate_role_name(
-    members: list,
-    identities,
-    cluster_id: int,
-    config: MiningConfig,
-) -> str:
-    """
-    Auto-generate role name from HR attribute dominance.
-
-    Returns semantic name like "Engineering - DevOps Engineer"
-    or numeric fallback like "ROLE_007"
-    """
-    if not config.auto_generate_role_names or not members:
-        return f"ROLE_{cluster_id:03d}"
-
-    # Get HR data for members
-    member_ids = [m for m in members if m in identities.index]
-    if not member_ids:
-        return f"ROLE_{cluster_id:03d}"
-
-    member_data = identities.loc[member_ids]
-
-    primary_attr = config.role_name_primary_attr
-    secondary_attr = config.role_name_secondary_attr
-    min_dominance = config.role_name_min_dominance
-
-    # Check primary attribute
-    if primary_attr in member_data.columns:
-        primary_counts = member_data[primary_attr].value_counts()
-        if not primary_counts.empty:
-            top_primary = primary_counts.index[0]
-            top_primary_pct = primary_counts.iloc[0] / len(member_data)
-
-            if top_primary_pct >= min_dominance:
-                # Check secondary
-                if secondary_attr in member_data.columns:
-                    secondary_counts = member_data[secondary_attr].value_counts()
-                    if not secondary_counts.empty:
-                        top_secondary = secondary_counts.index[0]
-                        top_secondary_pct = secondary_counts.iloc[0] / len(member_data)
-
-                        if top_secondary_pct >= min_dominance:
-                            return f"{top_primary} - {top_secondary}"
-
-                return str(top_primary)
-
-    # Fallback: numeric
-    return f"ROLE_{cluster_id:03d}"
-
-
-def _summarize_hr_attributes(members: list, identities) -> dict:
-    """Get top HR attribute values for role members."""
-    member_ids = [m for m in members if m in identities.index]
-    if not member_ids:
-        return {}
-
-    member_data = identities.loc[member_ids]
-
-    hr_cols = ["department", "business_unit", "jobcode", "job_level", "location_country"]
-    summary = {}
-
-    for col in hr_cols:
-        if col not in member_data.columns:
-            continue
-
-        counts = member_data[col].value_counts().head(3)
-        summary[col] = [
-            {
-                "value": str(v),
-                "count": int(c),
-                "pct": round(c / len(member_data), 4),
-            }
-            for v, c in counts.items()
-        ]
-
-    return summary
-
-
-def _build_birthright_role(birthright_result: dict, catalog) -> dict:
-    """Build birthright role structure."""
-    birthright_ents = birthright_result["birthright_entitlements"]
-    birthright_stats = birthright_result["birthright_stats"]
-
-    # Enrich with catalog
-    entitlements_detail = []
-    if catalog is not None:
-        catalog_lookup = {
-            row["namespaced_id"]: {
-                "app_id": row["APP_ID"],
-                "ent_name": row.get("ENT_NAME", row["ENT_ID"]),
-            }
-            for _, row in catalog.iterrows()
-        }
-
-        for ent_id in birthright_ents:
-            detail = catalog_lookup.get(ent_id, {})
-            entitlements_detail.append({
-                "entitlement_id": ent_id,
-                "app_id": detail.get("app_id", ent_id.split(":")[0]),
-                "ent_name": detail.get("ent_name", ent_id.split(":")[-1]),
-            })
-    else:
-        for ent_id in birthright_ents:
-            parts = ent_id.split(":", 1)
-            entitlements_detail.append({
-                "entitlement_id": ent_id,
-                "app_id": parts[0] if len(parts) == 2 else "",
-                "ent_name": parts[1] if len(parts) == 2 else ent_id,
-            })
-
-    return {
-        "role_id": "ROLE_BIRTHRIGHT",
-        "role_name": "Organization-Wide Baseline Access",
-        "entitlements": birthright_ents,
-        "entitlement_count": len(birthright_ents),
-        "stats": birthright_stats,
-        "entitlements_detail": entitlements_detail,
-    }
+# CHANGED: Removed _build_draft_roles_from_clusters, _generate_role_name,
+# _summarize_hr_attributes, _build_birthright_role.
+# These were duplicates of logic now in services/role_builder.py.
+# The mine_v2 route calls build_roles() which handles all role construction,
+# naming (ROLE_NNN), HR summary (from config user_attributes), and birthright.
 
 
 def _build_summary(cluster_result: dict, birthright_result: dict, matrix) -> dict:

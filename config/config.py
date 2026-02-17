@@ -1,3 +1,4 @@
+# config/config.py
 """
 Role Mining V2 Configuration
 Hybrid approach with daily reclustering, business role governance, and drift detection.
@@ -39,10 +40,17 @@ VALIDATION_RULES = {
         "error_low": "Coverage < 0.3 assigns users to too many roles",
         "error_high": "Coverage > 0.8 leaves most users unassigned",
     },
-    "attribute_weights": {
-        "sum": 1.0,
-        "tolerance": 0.001,
-        "error": "Weights must sum to 1.0",
+    # CHANGED: removed attribute_weights rule, replaced with user_attributes
+    "user_attributes": {
+        "min_count": 2,
+        "max_count": 5,
+        "weight_sum": 1.0,
+        "weight_tolerance": 0.01,
+        "error_count": "Must specify 2-5 user attributes",
+        "error_weight_sum": "Attribute weights must sum to 1.0",
+        "error_weight_range": "Each attribute weight must be > 0 and <= 1.0",
+        "error_duplicate": "Duplicate attribute column names not allowed",
+        "error_missing_column": "Each attribute must have a 'column' field",
     },
     "max_clusters_per_user": {
         "min": 1,
@@ -52,6 +60,31 @@ VALIDATION_RULES = {
     "min_entitlements_per_role": {
         "min": 2,
         "error": "Must be >= 2 (single-entitlement roles are not meaningful)",
+    },
+    # ADDED: prevalence-based role overlap parameters
+    "entitlement_prevalence_threshold": {
+        "min": 0.5,
+        "max": 1.0,
+        "error_low": "Prevalence threshold < 0.5 produces noisy core sets",
+        "error_high": "Prevalence threshold cannot exceed 1.0",
+    },
+    "entitlement_association_threshold": {
+        "min": 0.2,
+        "max": 0.8,
+        "error_low": "Association threshold < 0.2 captures noise",
+        "error_high": "Association threshold > 0.8 leaves no room between tiers",
+    },
+    "birthright_promotion_threshold": {
+        "min": 0.3,
+        "max": 0.8,
+        "error_low": "Birthright promotion threshold < 0.3 flags too many entitlements",
+        "error_high": "Birthright promotion threshold > 0.8 misses cross-role entitlements",
+    },
+    "role_merge_similarity_threshold": {
+        "min": 0.5,
+        "max": 0.9,
+        "error_low": "Merge threshold < 0.5 flags too many role pairs",
+        "error_high": "Merge threshold > 0.9 misses near-identical roles",
     },
     "drift_auto_approve_threshold": {
         "min": 0.0,
@@ -93,6 +126,7 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
 
     # User assignment to clusters
     "min_entitlement_coverage": 0.5,  # User must have 50%+ of cluster entitlements
+    "min_absolute_overlap": 2,            # User must match at least this many ents (floor)
     "max_clusters_per_user": 5,  # Cap multi-membership (realistic limit)
 
     # Cluster filtering
@@ -102,10 +136,9 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
     # =========================================================================
     # BUSINESS ROLE MANAGEMENT (New for Hybrid)
     # =========================================================================
-    "auto_generate_role_names": True,  # Create semantic names from HR attrs
-    "role_name_primary_attr": "department",  # Primary attribute for naming
-    "role_name_secondary_attr": "jobcode",  # Secondary attribute for naming
-    "role_name_min_dominance": 0.6,  # 60%+ required to use attribute in name
+    # CHANGED: removed auto_generate_role_names, role_name_primary_attr,
+    # role_name_secondary_attr, role_name_min_dominance.
+    # Roles are named ROLE_001, ROLE_002 etc. Customer renames during review.
 
     # Role lifecycle
     "allow_draft_role_editing": True,  # Stakeholders can edit before approval
@@ -165,24 +198,21 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
     # =========================================================================
     # CONFIDENCE SCORING (Enhanced with Attributes + Drift, V2)
     # =========================================================================
-    "use_attribute_weighting": True,
+    # CHANGED: removed use_attribute_weighting, attribute_weights dict,
+    # attribute_columns dict. Replaced with customer-specified user_attributes.
 
-    # Attribute weights (must sum to 1.0)
-    "attribute_weights": {
-        "peer_group": 0.40,  # Cluster-based peer prevalence
-        "department": 0.25,  # Same department prevalence
-        "job_title": 0.20,  # Same job title prevalence
-        "location": 0.10,  # Same location prevalence
-        "manager": 0.05,  # Same manager prevalence
-    },
+    # Customer-specified user attributes for confidence scoring and HR summary.
+    # Must be configured before mining. 2-5 attributes from identities.csv.
+    # Each entry: {"column": "<col_name>", "weight": <0-1>} (weight optional).
+    # If weights omitted, equal weight (1/N) assigned automatically.
+    # If weights specified, must sum to 1.0.
+    "user_attributes": [],  # REQUIRED - empty default, validation catches it
 
-    # Attribute column mapping (identities DataFrame columns)
-    "attribute_columns": {
-        "department": "department",
-        "job_title": "jobcode",
-        "location": "location_country",
-        "manager": "manager",
-    },
+    # ADDED: prevalence-based role overlap thresholds
+    "entitlement_prevalence_threshold": 0.75,  # >= 75% of role members = core entitlement
+    "entitlement_association_threshold": 0.40,  # >= 40% and < prevalence = common entitlement
+    "birthright_promotion_threshold": 0.50,     # core in > 50% of roles = flag for birthright
+    "role_merge_similarity_threshold": 0.70,    # Jaccard > 0.70 of core sets = merge candidate
 
     # Drift stability factor (NEW)
     "use_drift_stability_factor": True,
@@ -269,15 +299,14 @@ class MiningConfig:
     leiden_resolution: float = 1.0
     leiden_random_seed: int = 42
     min_entitlement_coverage: float = 0.5
+    min_absolute_overlap: int = 2
     max_clusters_per_user: int = 5
     min_role_size: int = 10
     min_entitlements_per_role: int = 2
 
     # Business role management
-    auto_generate_role_names: bool = True
-    role_name_primary_attr: str = "department"
-    role_name_secondary_attr: str = "jobcode"
-    role_name_min_dominance: float = 0.6
+    # CHANGED: removed auto_generate_role_names, role_name_primary_attr,
+    # role_name_secondary_attr, role_name_min_dominance
     allow_draft_role_editing: bool = True
     require_role_owner: bool = True
     require_role_purpose: bool = False
@@ -308,20 +337,13 @@ class MiningConfig:
     notify_on_drift_alert: bool = True
 
     # Confidence scoring
-    use_attribute_weighting: bool = True
-    attribute_weights: Dict[str, float] = field(default_factory=lambda: {
-        "peer_group": 0.40,
-        "department": 0.25,
-        "job_title": 0.20,
-        "location": 0.10,
-        "manager": 0.05,
-    })
-    attribute_columns: Dict[str, str] = field(default_factory=lambda: {
-        "department": "department",
-        "job_title": "jobcode",
-        "location": "location_country",
-        "manager": "manager",
-    })
+    # CHANGED: removed use_attribute_weighting, attribute_weights, attribute_columns
+    # ADDED: user_attributes, prevalence thresholds
+    user_attributes: List[Dict[str, Any]] = field(default_factory=list)
+    entitlement_prevalence_threshold: float = 0.75
+    entitlement_association_threshold: float = 0.40
+    birthright_promotion_threshold: float = 0.50
+    role_merge_similarity_threshold: float = 0.70
     use_drift_stability_factor: bool = True
     drift_stability_weight: float = 0.1
     drift_stability_window_days: int = 7
@@ -404,11 +426,49 @@ class MiningConfig:
         if self.min_entitlement_coverage > rule["max"]:
             errors.append(f"min_entitlement_coverage > {rule['max']}: {rule['error_high']}")
 
-        # Attribute weights sum to 1.0
-        rule = VALIDATION_RULES["attribute_weights"]
-        total_weight = sum(self.attribute_weights.values())
-        if abs(total_weight - rule["sum"]) > rule["tolerance"]:
-            errors.append(f"attribute_weights sum to {total_weight:.3f}, must be {rule['sum']}: {rule['error']}")
+        # CHANGED: replaced attribute_weights validation with user_attributes
+        rule = VALIDATION_RULES["user_attributes"]
+        if not isinstance(self.user_attributes, list):
+            errors.append("user_attributes must be a list")
+        elif len(self.user_attributes) < rule["min_count"] or len(self.user_attributes) > rule["max_count"]:
+            errors.append(
+                f"user_attributes has {len(self.user_attributes)} entries: {rule['error_count']}"
+            )
+        else:
+            # Validate each entry has a column field
+            columns_seen = set()
+            has_any_weight = any("weight" in attr for attr in self.user_attributes)
+            has_all_weights = all("weight" in attr for attr in self.user_attributes)
+
+            for i, attr in enumerate(self.user_attributes):
+                if not isinstance(attr, dict) or "column" not in attr:
+                    errors.append(f"user_attributes[{i}]: {rule['error_missing_column']}")
+                    continue
+
+                col = attr["column"]
+                if not isinstance(col, str) or not col.strip():
+                    errors.append(f"user_attributes[{i}]: column must be a non-empty string")
+                    continue
+
+                if col in columns_seen:
+                    errors.append(f"user_attributes[{i}]: duplicate column '{col}': {rule['error_duplicate']}")
+                columns_seen.add(col)
+
+            # Weight validation: either all have weights or none do
+            if has_any_weight and not has_all_weights:
+                errors.append("user_attributes: if any entry has a weight, all must have a weight")
+            elif has_all_weights and len(self.user_attributes) >= rule["min_count"]:
+                for i, attr in enumerate(self.user_attributes):
+                    w = attr.get("weight", 0)
+                    if not isinstance(w, (int, float)) or w <= 0 or w > 1.0:
+                        errors.append(
+                            f"user_attributes[{i}] weight={w}: {rule['error_weight_range']}"
+                        )
+                total_weight = sum(attr.get("weight", 0) for attr in self.user_attributes)
+                if abs(total_weight - rule["weight_sum"]) > rule["weight_tolerance"]:
+                    errors.append(
+                        f"user_attributes weights sum to {total_weight:.3f}: {rule['error_weight_sum']}"
+                    )
 
         # Max clusters per user
         rule = VALIDATION_RULES["max_clusters_per_user"]
@@ -422,6 +482,38 @@ class MiningConfig:
         if self.min_entitlements_per_role < rule["min"]:
             errors.append(f"min_entitlements_per_role < {rule['min']}: {rule['error']}")
 
+        # ADDED: prevalence threshold validations
+        rule = VALIDATION_RULES["entitlement_prevalence_threshold"]
+        if self.entitlement_prevalence_threshold < rule["min"]:
+            errors.append(f"entitlement_prevalence_threshold < {rule['min']}: {rule['error_low']}")
+        if self.entitlement_prevalence_threshold > rule["max"]:
+            errors.append(f"entitlement_prevalence_threshold > {rule['max']}: {rule['error_high']}")
+
+        rule = VALIDATION_RULES["entitlement_association_threshold"]
+        if self.entitlement_association_threshold < rule["min"]:
+            errors.append(f"entitlement_association_threshold < {rule['min']}: {rule['error_low']}")
+        if self.entitlement_association_threshold > rule["max"]:
+            errors.append(f"entitlement_association_threshold > {rule['max']}: {rule['error_high']}")
+
+        # Cross-validation: association must be < prevalence
+        if self.entitlement_association_threshold >= self.entitlement_prevalence_threshold:
+            errors.append(
+                f"entitlement_association_threshold ({self.entitlement_association_threshold}) "
+                f"must be < entitlement_prevalence_threshold ({self.entitlement_prevalence_threshold})"
+            )
+
+        rule = VALIDATION_RULES["birthright_promotion_threshold"]
+        if self.birthright_promotion_threshold < rule["min"]:
+            errors.append(f"birthright_promotion_threshold < {rule['min']}: {rule['error_low']}")
+        if self.birthright_promotion_threshold > rule["max"]:
+            errors.append(f"birthright_promotion_threshold > {rule['max']}: {rule['error_high']}")
+
+        rule = VALIDATION_RULES["role_merge_similarity_threshold"]
+        if self.role_merge_similarity_threshold < rule["min"]:
+            errors.append(f"role_merge_similarity_threshold < {rule['min']}: {rule['error_low']}")
+        if self.role_merge_similarity_threshold > rule["max"]:
+            errors.append(f"role_merge_similarity_threshold > {rule['max']}: {rule['error_high']}")
+
         # Drift auto-approve threshold
         rule = VALIDATION_RULES["drift_auto_approve_threshold"]
         if self.drift_auto_approve_threshold < rule["min"]:
@@ -430,6 +522,62 @@ class MiningConfig:
             errors.append(f"drift_auto_approve_threshold > {rule['max']}: {rule['error_high']}")
 
         return errors
+
+    def validate_against_data(self, identities_columns: List[str]) -> List[str]:
+        """
+        ADDED: Validate that user_attributes columns exist in actual data.
+
+        Called at mining time after file upload, not at config time.
+        Hard fail if any configured attribute column is missing from identities.csv.
+
+        Args:
+            identities_columns: List of column names from identities.csv
+
+        Returns:
+            List of error messages (empty if valid)
+        """
+        errors = []
+
+        # USR_ID is mandatory
+        if "USR_ID" not in identities_columns:
+            errors.append("identities.csv must contain 'USR_ID' column")
+
+        # Every configured attribute column must exist
+        for attr in self.user_attributes:
+            col = attr.get("column", "")
+            if col not in identities_columns:
+                errors.append(
+                    f"Attribute column '{col}' not found in identities.csv. "
+                    f"Available columns: {', '.join(sorted(identities_columns))}"
+                )
+
+        return errors
+
+    def get_attribute_columns(self) -> List[str]:
+        """
+        ADDED: Get list of configured attribute column names.
+
+        Convenience method used by role_builder and confidence_scorer.
+        """
+        return [attr["column"] for attr in self.user_attributes]
+
+    def get_attribute_weights(self) -> Dict[str, float]:
+        """
+        ADDED: Get column->weight mapping. Auto-assigns equal weights if not specified.
+
+        Returns:
+            Dict mapping column name to weight, guaranteed to sum to 1.0.
+        """
+        n = len(self.user_attributes)
+        if n == 0:
+            return {}
+
+        has_weights = all("weight" in attr for attr in self.user_attributes)
+        if has_weights:
+            return {attr["column"]: attr["weight"] for attr in self.user_attributes}
+        else:
+            equal_weight = 1.0 / n
+            return {attr["column"]: equal_weight for attr in self.user_attributes}
 
 
 # ============================================================================

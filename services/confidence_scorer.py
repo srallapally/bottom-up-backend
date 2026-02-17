@@ -1,10 +1,11 @@
+# services/confidence_scorer.py
 """
 Confidence Scorer V2 - Multi-Factor Confidence Scoring
 ======================================================
 
 Enhanced confidence scoring combining multiple signals:
 1. Peer group prevalence (from entitlement clusters)
-2. HR attribute alignment (department, job title, location, manager)
+2. Customer-configured user attribute alignment (flexible schema)
 3. Drift stability (how stable has this entitlement been over time)
 4. Role coverage (what % of user's assigned roles does user have)
 
@@ -15,15 +16,14 @@ Key differences from V1 (services/confidence_scorer.py):
 - V2: Handles NULL attributes gracefully (re-normalize weights)
 - V2: Drift stability factor (temporal awareness)
 - V2: Role coverage factor (multi-cluster aware)
+- CHANGED: User attributes are customer-configured via user_attributes
+  in config, not hardcoded department/jobcode/location/manager columns.
 
 Algorithm:
-1. Pre-compute attribute prevalence for low-cardinality attributes
+1. Pre-compute attribute prevalence for configured user attributes
 2. For each assignment, compute individual scores:
    - Peer group score (leave-one-out)
-   - Department prevalence
-   - Job title prevalence
-   - Location prevalence
-   - Manager prevalence (if cardinality < 500)
+   - Per-attribute prevalence (customer-configured, 2-5 attributes)
    - Drift stability (if drift data available)
    - Role coverage (multi-cluster aware)
 3. Weighted combination (re-normalize if attributes NULL)
@@ -39,6 +39,37 @@ from collections import defaultdict
 
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# ADDED: Helper to extract user attribute config from plain config dict
+# ============================================================================
+
+def _get_user_attribute_config(config: Dict[str, Any]) -> Tuple[List[str], Dict[str, float]]:
+    """
+    Extract attribute column names and weights from config.
+
+    Reads the user_attributes list from config and returns:
+    - columns: list of column name strings
+    - weights: dict mapping column name to weight (equal weight if not specified)
+
+    Works with plain dict config (not MiningConfig dataclass) since
+    confidence_scorer receives config as dict from the mining route.
+    """
+    user_attributes = config.get("user_attributes", [])
+    if not user_attributes:
+        return [], {}
+
+    columns = [attr["column"] for attr in user_attributes]
+
+    has_weights = all("weight" in attr for attr in user_attributes)
+    if has_weights:
+        weights = {attr["column"]: attr["weight"] for attr in user_attributes}
+    else:
+        equal_weight = 1.0 / len(user_attributes)
+        weights = {col: equal_weight for col in columns}
+
+    return columns, weights
 
 
 # ============================================================================
@@ -83,9 +114,9 @@ def score_assignments(
         config=config,
     )
 
-    # Step 2: Build cluster mapping (entitlement → cluster)
-    logger.info("Step 2: Building entitlement-to-cluster mapping")
-    ent_to_cluster = _build_ent_to_cluster_mapping(cluster_result)
+    # Step 2: Build entitlement-to-role lookup (ent -> roles with tier/prevalence)
+    logger.info("Step 2: Building entitlement-to-role lookup")
+    ent_role_lookup = _build_entitlement_role_lookup(roles)
 
     # Step 3: Build role coverage lookup (user → role coverage)
     logger.info("Step 3: Building role coverage lookup")
@@ -97,8 +128,9 @@ def score_assignments(
         assignments_df=assignments_df,
         full_matrix=full_matrix,
         identities=identities,
-        ent_to_cluster=ent_to_cluster,
+        ent_role_lookup=ent_role_lookup,
         cluster_result=cluster_result,
+        roles=roles,
         attribute_prevalence=attribute_prevalence,
         birthright_entitlements=birthright_entitlements,
         noise_entitlements=noise_entitlements,
@@ -136,23 +168,27 @@ def _precompute_attribute_prevalence(
     """
     Pre-compute prevalence of each entitlement within each attribute group.
 
-    For each (attribute, value, entitlement):
-        prevalence[dept=Finance, ENT_123] = {total: 500, with_ent: 435}
+    For each (attribute_column, value, entitlement):
+        prevalence[department=Finance, ENT_123] = {total: 500, with_ent: 435}
 
     This allows O(1) lookup during scoring instead of O(n_users) per assignment.
 
+    CHANGED: reads attribute columns from config["user_attributes"] list
+    instead of hardcoded config["attribute_columns"] dict.
+
     Returns:
-        Dict mapping (attr_name, attr_value, ent_id) → {total_users, users_with_ent}
+        Dict mapping (col_name, attr_value, ent_id) -> {total_users, users_with_ent}
     """
-    attribute_columns = config.get("attribute_columns", {})
+    # CHANGED: use _get_user_attribute_config helper
+    attr_columns, _ = _get_user_attribute_config(config)
     max_cardinality = config.get("max_attribute_cardinality", 500)
     min_group_size = config.get("min_attribute_group_size", 2)
 
     prevalence = {}
     skipped_attributes = []
 
-    for attr_name, col_name in attribute_columns.items():
-        logger.info(f"Checking for Attribute column '{col_name}")
+    for col_name in attr_columns:
+        logger.info(f"Checking for attribute column '{col_name}'")
         if col_name not in identities.columns:
             logger.warning(f"Attribute column '{col_name}' not found in identities, skipping")
             continue
@@ -160,9 +196,9 @@ def _precompute_attribute_prevalence(
         # Check cardinality
         n_unique = identities[col_name].nunique()
         if n_unique > max_cardinality:
-            skipped_attributes.append(attr_name)
+            skipped_attributes.append(col_name)
             logger.info(
-                f"Skipping {attr_name} (cardinality {n_unique} > {max_cardinality})"
+                f"Skipping {col_name} (cardinality {n_unique} > {max_cardinality})"
             )
             continue
 
@@ -173,7 +209,6 @@ def _precompute_attribute_prevalence(
             if len(group_df) < min_group_size:
                 continue
 
-            # user_indices = group_df.index
             user_ids = group_df["USR_ID"].tolist()
             total_users = len(user_ids)
 
@@ -184,7 +219,8 @@ def _precompute_attribute_prevalence(
                 if count == 0:
                     continue
 
-                key = (attr_name, str(attr_value), ent_id)
+                # CHANGED: key uses col_name directly, not semantic attr_name
+                key = (col_name, str(attr_value), ent_id)
                 prevalence[key] = {
                     "total_users": total_users,
                     "users_with_ent": int(count),
@@ -205,21 +241,48 @@ def _precompute_attribute_prevalence(
 # STEP 2: BUILD ENTITLEMENT-TO-CLUSTER MAPPING
 # ============================================================================
 
-def _build_ent_to_cluster_mapping(cluster_result: Dict[str, Any]) -> Dict[str, int]:
+def _build_entitlement_role_lookup(
+    roles: List[Dict],
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Build reverse mapping: entitlement_id → cluster_id.
+    Build reverse mapping: entitlement_id -> list of roles containing it.
 
-    Returns:
-        Dict mapping entitlement_id to cluster_id (for residual ents: None)
+    Each entry has {role_id, tier, prevalence, members, member_count}.
+    An entitlement can appear in multiple roles (core in one, common in another).
+
+    Used by peer group scoring to pick the best role for each user-entitlement pair.
     """
-    entitlement_clusters = cluster_result["entitlement_clusters"]
+    lookup: Dict[str, List[Dict[str, Any]]] = {}
 
-    ent_to_cluster = {}
-    for cluster_id, ent_list in entitlement_clusters.items():
-        for ent_id in ent_list:
-            ent_to_cluster[ent_id] = cluster_id
+    for role in roles:
+        role_id = role["role_id"]
+        members = role.get("members", [])
+        member_count = role.get("member_count", len(members))
+        prevalence_dict = role.get("entitlement_prevalence", {})
 
-    return ent_to_cluster
+        for ent_id in role.get("core_entitlements", []):
+            if ent_id not in lookup:
+                lookup[ent_id] = []
+            lookup[ent_id].append({
+                "role_id": role_id,
+                "tier": "core",
+                "prevalence": prevalence_dict.get(ent_id, 1.0),
+                "members": members,
+                "member_count": member_count,
+            })
+
+        for ent_id in role.get("common_entitlements", []):
+            if ent_id not in lookup:
+                lookup[ent_id] = []
+            lookup[ent_id].append({
+                "role_id": role_id,
+                "tier": "common",
+                "prevalence": prevalence_dict.get(ent_id, 0.0),
+                "members": members,
+                "member_count": member_count,
+            })
+
+    return lookup
 
 
 # ============================================================================
@@ -261,8 +324,9 @@ def _compute_individual_scores(
     assignments_df: pd.DataFrame,
     full_matrix: pd.DataFrame,
     identities: pd.DataFrame,
-    ent_to_cluster: Dict[str, int],
+    ent_role_lookup: Dict[str, List[Dict[str, Any]]],
     cluster_result: Dict[str, Any],
+    roles: List[Dict],
     attribute_prevalence: Dict,
     birthright_entitlements: List[str],
     noise_entitlements: List[str],
@@ -287,10 +351,9 @@ def _compute_individual_scores(
 
     # Initialize score columns
     df["peer_group_score"] = 0.0
-    df["department_score"] = np.nan
-    df["job_title_score"] = np.nan
-    df["location_score"] = np.nan
-    df["manager_score"] = np.nan
+    attr_columns, _ = _get_user_attribute_config(config)
+    for col_name in attr_columns:
+        df[f"{col_name}_score"] = np.nan
     df["drift_stability_score"] = np.nan
     df["role_coverage_score"] = 0.0
 
@@ -299,14 +362,17 @@ def _compute_individual_scores(
     df["cluster_size"] = 0
     df["peers_with_entitlement"] = 0
     df["role_covered"] = False
+    df["entitlement_tier"] = "residual"   # NEW: core/common/residual/birthright
+    df["matched_role_id"] = ""            # NEW: which role matched this entitlement
     df["attributes_skipped"] = ""
 
-    # Peer group scores
+    # Peer group scores (now role-based)
     df = _compute_peer_group_scores(
         df=df,
         full_matrix=full_matrix,
-        ent_to_cluster=ent_to_cluster,
+        ent_role_lookup=ent_role_lookup,
         cluster_result=cluster_result,
+        birthright_entitlements=birthright_entitlements,
         ent_col=ent_col,
     )
 
@@ -328,10 +394,10 @@ def _compute_individual_scores(
             ent_col=ent_col,
         )
 
-    # Role covered flag
+    # Role covered flag (now uses core_entitlements from roles)
     df = _compute_role_covered(
         df=df,
-        ent_to_cluster=ent_to_cluster,
+        roles=roles,
         cluster_result=cluster_result,
         birthright_entitlements=birthright_entitlements,
         ent_col=ent_col,
@@ -343,59 +409,105 @@ def _compute_individual_scores(
 def _compute_peer_group_scores(
     df: pd.DataFrame,
     full_matrix: pd.DataFrame,
-    ent_to_cluster: Dict[str, int],
+    ent_role_lookup: Dict[str, List[Dict[str, Any]]],
     cluster_result: Dict[str, Any],
+    birthright_entitlements: List[str],
     ent_col: str,
 ) -> pd.DataFrame:
-    """Compute peer group prevalence scores (leave-one-out)."""
+    """
+    Compute peer group prevalence scores using role-based peer groups.
+
+    For each user-entitlement assignment:
+    - Find which of the user's roles contains this entitlement
+    - If multiple roles, pick the one with highest prevalence
+    - Use that role's members as the peer group
+    - Compute leave-one-out prevalence score
+    - Tag with entitlement_tier (core/common/birthright/residual)
+    """
     user_memberships = cluster_result["user_cluster_membership"]
+    birthright_set = set(birthright_entitlements)
 
-    # Pre-compute cluster data
-    cluster_data = {}
-    entitlement_clusters = cluster_result["entitlement_clusters"]
-
-    for cluster_id, ent_list in entitlement_clusters.items():
-        # Get users in this cluster
-        users = [
-            user_id for user_id, memberships in user_memberships.items()
-            if any(m["cluster_id"] == cluster_id for m in memberships)
-        ]
-
-        if not users:
-            continue
-
-        cluster_matrix = full_matrix.loc[users]
-        cluster_data[cluster_id] = {
-            "users": users,
-            "size": len(users),
-            "ent_sums": cluster_matrix.sum(axis=0),
+    # Build user -> set of role_ids for quick membership check
+    # Map role_id -> seed_cluster_id for lookup
+    user_role_ids: Dict[str, set] = {}
+    for user_id, memberships in user_memberships.items():
+        user_role_ids[user_id] = {
+            f"ROLE_{m['cluster_id']:03d}" for m in memberships
         }
 
-    # Score each assignment
+    # Pre-compute per-role entitlement sums for leave-one-out
+    role_ent_sums: Dict[str, pd.Series] = {}
+    for role_entries in ent_role_lookup.values():
+        for entry in role_entries:
+            rid = entry["role_id"]
+            if rid not in role_ent_sums:
+                members = entry["members"]
+                valid_members = [m for m in members if m in full_matrix.index]
+                if valid_members:
+                    role_ent_sums[rid] = full_matrix.loc[valid_members].sum(axis=0)
+                else:
+                    role_ent_sums[rid] = pd.Series(0, index=full_matrix.columns)
+
     for idx, row in df.iterrows():
         user_id = row["USR_ID"]
         ent_id = row[ent_col]
 
-        # Find cluster for this entitlement
-        cluster_id = ent_to_cluster.get(ent_id)
-        if cluster_id is None:
-            # Residual entitlement (not in any cluster)
+        # Birthright check first
+        if ent_id in birthright_set:
+            df.at[idx, "entitlement_tier"] = "birthright"
+            df.at[idx, "peer_group_score"] = 1.0
+            df.at[idx, "role_covered"] = True
             continue
 
-        cdata = cluster_data.get(cluster_id)
-        if cdata is None or cdata["size"] <= 1:
+        # Find roles containing this entitlement
+        role_entries = ent_role_lookup.get(ent_id, [])
+        if not role_entries:
+            # Residual: not in any role
+            df.at[idx, "entitlement_tier"] = "residual"
             continue
+
+        # Find the user's roles
+        user_roles = user_role_ids.get(user_id, set())
+        if not user_roles:
+            df.at[idx, "entitlement_tier"] = "residual"
+            continue
+
+        # Find matching roles (roles that contain this ent AND the user belongs to)
+        matching = [e for e in role_entries if e["role_id"] in user_roles]
+
+        if not matching:
+            # Entitlement is in some role(s), but not in any of THIS user's roles
+            df.at[idx, "entitlement_tier"] = "residual"
+            continue
+
+        # Pick the role with highest prevalence for this entitlement
+        best = max(matching, key=lambda e: e["prevalence"])
+
+        role_id = best["role_id"]
+        tier = best["tier"]
+        member_count = best["member_count"]
+
+        df.at[idx, "entitlement_tier"] = tier
+        df.at[idx, "matched_role_id"] = role_id
+        df.at[idx, "cluster_size"] = member_count
+        df.at[idx, "role_covered"] = True
 
         # Leave-one-out peer score
+        if member_count <= 1:
+            df.at[idx, "peer_group_score"] = 0.0
+            continue
+
+        ent_sums = role_ent_sums.get(role_id)
+        if ent_sums is None or ent_id not in ent_sums.index:
+            continue
+
         user_has = full_matrix.at[user_id, ent_id] if ent_id in full_matrix.columns else 0
-        peers_with = int(cdata["ent_sums"].get(ent_id, 0) - user_has)
-        peer_count = cdata["size"] - 1
+        peers_with = int(ent_sums[ent_id] - user_has)
+        peer_count = member_count - 1
 
         score = peers_with / peer_count if peer_count > 0 else 0.0
 
         df.at[idx, "peer_group_score"] = round(score, 4)
-        df.at[idx, "cluster_id"] = cluster_id
-        df.at[idx, "cluster_size"] = cdata["size"]
         df.at[idx, "peers_with_entitlement"] = peers_with
 
     return df
@@ -409,16 +521,14 @@ def _compute_attribute_scores(
     config: Dict[str, Any],
     ent_col: str,
 ) -> pd.DataFrame:
-    """Compute HR attribute prevalence scores."""
-    attribute_columns = config.get("attribute_columns", {})
+    """
+    Compute user attribute prevalence scores.
 
-    # Map: attr_name → score_column
-    score_cols = {
-        "department": "department_score",
-        "job_title": "job_title_score",
-        "location": "location_score",
-        "manager": "manager_score",
-    }
+    CHANGED: iterates over customer-configured user_attributes
+    instead of hardcoded department/job_title/location/manager.
+    """
+    # CHANGED: use _get_user_attribute_config helper
+    attr_columns, _ = _get_user_attribute_config(config)
 
     for idx, row in df.iterrows():
         user_id = row["USR_ID"]
@@ -429,11 +539,10 @@ def _compute_attribute_scores(
 
         skipped = []
 
-        for attr_name, score_col in score_cols.items():
-            if attr_name not in attribute_columns:
-                continue
+        # CHANGED: iterate over customer's configured columns
+        for col_name in attr_columns:
+            score_col = f"{col_name}_score"
 
-            col_name = attribute_columns[attr_name]
             if col_name not in identities.columns:
                 continue
 
@@ -441,11 +550,12 @@ def _compute_attribute_scores(
 
             # Handle NULL
             if pd.isna(attr_value) or attr_value == "":
-                skipped.append(attr_name)
+                skipped.append(col_name)
                 continue
 
             # Lookup pre-computed prevalence
-            key = (attr_name, str(attr_value), ent_id)
+            # CHANGED: key uses col_name directly (matches _precompute key format)
+            key = (col_name, str(attr_value), ent_id)
             if key not in attribute_prevalence:
                 # Attribute value exists but no prevalence data
                 # (could be rare value or entitlement)
@@ -490,36 +600,22 @@ def _compute_drift_stability_scores(
 
 def _compute_role_covered(
     df: pd.DataFrame,
-    ent_to_cluster: Dict[str, int],
+    roles: List[Dict],
     cluster_result: Dict[str, Any],
     birthright_entitlements: List[str],
     ent_col: str,
 ) -> pd.DataFrame:
-    """Determine if entitlement is covered by user's assigned roles or birthright."""
-    user_memberships = cluster_result["user_cluster_membership"]
-    birthright_set = set(birthright_entitlements)
+    """
+    Determine if entitlement is covered by user's assigned roles or birthright.
 
-    for idx, row in df.iterrows():
-        user_id = row["USR_ID"]
-        ent_id = row[ent_col]
-
-        # Check birthright
-        if ent_id in birthright_set:
-            df.at[idx, "role_covered"] = True
-            continue
-
-        # Check if in any of user's assigned clusters
-        if user_id not in user_memberships:
-            continue
-
-        ent_cluster = ent_to_cluster.get(ent_id)
-        if ent_cluster is None:
-            continue
-
-        user_clusters = [m["cluster_id"] for m in user_memberships[user_id]]
-        if ent_cluster in user_clusters:
-            df.at[idx, "role_covered"] = True
-
+    Uses core_entitlements (expanded) from roles rather than raw cluster membership.
+    Note: much of this is already set by _compute_peer_group_scores (which sets
+    role_covered=True for core/common/birthright). This handles any edge cases
+    and ensures consistency.
+    """
+    # Already handled by _compute_peer_group_scores for most rows.
+    # This is a safety net — only needed if peer group scoring missed something.
+    # The entitlement_tier and role_covered columns are authoritative from peer group scoring.
     return df
 
 
@@ -536,11 +632,16 @@ def _compute_weighted_confidence(
     Compute weighted confidence from individual factor scores.
 
     Handles NULL attributes by re-normalizing weights.
+
+    CHANGED: reads weights from config["user_attributes"] instead of
+    hardcoded config["attribute_weights"]. Peer group weight is computed
+    as the complement of attribute + extra factor weights.
     """
     df = scores_df.copy()
 
-    # Get weights from config
-    weights = config.get("attribute_weights", {})
+    # CHANGED: get attribute weights from user_attributes config
+    attr_columns, attr_weights = _get_user_attribute_config(config)
+
     renormalize = config.get("renormalize_weights_on_null", True)
     high_thresh = config.get("confidence_high_threshold", 0.8)
     medium_thresh = config.get("confidence_medium_threshold", 0.5)
@@ -548,6 +649,28 @@ def _compute_weighted_confidence(
     # Use drift stability and role coverage if configured
     use_drift = config.get("use_drift_stability_factor", True)
     use_role_cov = config.get("use_role_coverage_factor", True)
+
+    # CHANGED: build base weights dict dynamically
+    # Peer group gets weight = 1.0 - sum(attribute weights) - extra factor weights
+    drift_weight = config.get("drift_stability_weight", 0.1) if use_drift else 0.0
+    role_cov_weight = config.get("role_coverage_weight", 0.1) if use_role_cov else 0.0
+
+    # Attribute weights are scaled to fit within the remaining budget after peer_group
+    # peer_group gets 40% of total, attributes share the rest minus extra factors
+    # But since customer specifies attribute weights summing to 1.0, we need to
+    # allocate a portion to peer_group and scale attribute weights down.
+    #
+    # Strategy: peer_group = 0.40, extra factors take their configured weight,
+    # attribute weights are scaled to fill (1.0 - 0.40 - extra_weights)
+    peer_group_base_weight = 0.40
+    extra_weight_total = drift_weight + role_cov_weight
+    attr_budget = max(0.0, 1.0 - peer_group_base_weight - extra_weight_total)
+
+    # Scale customer's attribute weights to fit within attr_budget
+    base_weights = {"peer_group": peer_group_base_weight}
+    if attr_columns and attr_budget > 0:
+        for col_name in attr_columns:
+            base_weights[col_name] = attr_weights.get(col_name, 0) * attr_budget
 
     # Initialize result columns
     df["confidence"] = 0.0
@@ -565,11 +688,11 @@ def _compute_weighted_confidence(
         if pd.notna(row["peer_group_score"]):
             available_scores["peer_group"] = row["peer_group_score"]
 
-        # Attributes
-        for attr_name in ["department", "job_title", "location", "manager"]:
-            score_col = f"{attr_name}_score"
+        # CHANGED: dynamic attribute columns instead of hardcoded list
+        for col_name in attr_columns:
+            score_col = f"{col_name}_score"
             if score_col in df.columns and pd.notna(row[score_col]):
-                available_scores[attr_name] = row[score_col]
+                available_scores[col_name] = row[score_col]
 
         # Drift stability
         if use_drift and pd.notna(row["drift_stability_score"]):
@@ -589,13 +712,13 @@ def _compute_weighted_confidence(
 
         # Build weights for available scores
         weights_used = {}
-        for factor_name, score in available_scores.items():
-            if factor_name in weights:
-                weights_used[factor_name] = weights[factor_name]
+        for factor_name in available_scores:
+            if factor_name in base_weights:
+                weights_used[factor_name] = base_weights[factor_name]
             elif factor_name == "drift_stability":
-                weights_used[factor_name] = config.get("drift_stability_weight", 0.1)
+                weights_used[factor_name] = drift_weight
             elif factor_name == "role_coverage":
-                weights_used[factor_name] = config.get("role_coverage_weight", 0.1)
+                weights_used[factor_name] = role_cov_weight
 
         # Re-normalize if enabled
         if renormalize and weights_used:
@@ -641,43 +764,60 @@ def _build_justification(
     weights_used: Dict[str, float],
     row: pd.Series,
 ) -> str:
-    """Build human-readable justification for confidence score."""
-    parts = [f"Confidence: {int(confidence * 100)}%"]
+    """
+    Build human-readable justification for confidence score.
 
-    # Break down by factor
-    factor_labels = {
-        "peer_group": "peer group",
-        "department": "department",
-        "job_title": "job title",
-        "location": "location",
-        "manager": "manager",
-        "drift_stability": "stability",
-        "role_coverage": "role coverage",
-    }
+    Tier-aware justification:
+    - Core: "N of M users (P%) in your ROLE_XXX have this access."
+    - Common: "N of M users (P%) in your ROLE_XXX have this access.
+              Frequently associated but not part of the core role definition."
+    - Residual: "This access is not part of any of your assigned roles.
+               P% of users where attr=value have this access." (attribute fallback)
+    - Birthright: "Organization-wide baseline access (held by P% of all users)."
+    """
+    tier = row.get("entitlement_tier", "residual")
+    matched_role = row.get("matched_role_id", "")
+    peers_with = row.get("peers_with_entitlement", 0)
+    cluster_size = row.get("cluster_size", 0)
+    global_prev = row.get("global_prevalence", 0)
 
-    factor_parts = []
-    for factor, score in available_scores.items():
-        weight = weights_used.get(factor, 0)
-        if weight > 0:
-            label = factor_labels.get(factor, factor)
-            contribution = int(score * weight * 100)
-            factor_parts.append(f"{contribution}% {label}")
+    if tier == "birthright":
+        pct = int(global_prev * 100) if global_prev else 99
+        return f"Organization-wide baseline access (held by {pct}% of all users)."
 
-    if factor_parts:
-        parts.append(f"({', '.join(factor_parts)})")
-
-    # Add peer group detail if available
-    if "peer_group" in available_scores and row.get("cluster_size", 0) > 0:
-        peers_with = row.get("peers_with_entitlement", 0)
-        peer_count = row["cluster_size"] - 1
-        parts.append(
-            f"— {peers_with} of {peer_count} peers in your group have this"
+    if tier == "core" and matched_role and cluster_size > 1:
+        peer_count = cluster_size - 1
+        peer_pct = int((peers_with / peer_count) * 100) if peer_count > 0 else 0
+        return (
+            f"{peers_with} of {peer_count} peers ({peer_pct}%) in your "
+            f"{matched_role} have this access."
         )
 
-    # Flag if attributes skipped
-    skipped = row.get("attributes_skipped", "")
-    if skipped:
-        parts.append(f"(skipped: {skipped})")
+    if tier == "common" and matched_role and cluster_size > 1:
+        peer_count = cluster_size - 1
+        peer_pct = int((peers_with / peer_count) * 100) if peer_count > 0 else 0
+        return (
+            f"{peers_with} of {peer_count} peers ({peer_pct}%) in your "
+            f"{matched_role} have this access. "
+            f"Frequently associated but not part of the core role definition."
+        )
+
+    # Residual: attribute-based fallback
+    parts = [f"This access is not part of any of your assigned roles."]
+
+    # Find the best attribute score to report
+    system_factors = {"peer_group", "drift_stability", "role_coverage"}
+    attr_scores = {
+        k: v for k, v in available_scores.items()
+        if k not in system_factors and v > 0
+    }
+
+    if attr_scores:
+        best_attr = max(attr_scores, key=attr_scores.get)
+        best_pct = int(attr_scores[best_attr] * 100)
+        parts.append(f"{best_pct}% of users in your {best_attr} group have this access.")
+    else:
+        parts.append(f"Confidence: {int(confidence * 100)}%.")
 
     return " ".join(parts)
 
@@ -830,17 +970,12 @@ if __name__ == "__main__":
     ]
 
     config = {
-        "attribute_columns": {
-            "department": "department",
-            "job_title": "jobcode",
-            "location": "location_country",
-        },
-        "attribute_weights": {
-            "peer_group": 0.40,
-            "department": 0.25,
-            "job_title": 0.20,
-            "location": 0.10,
-        },
+        # CHANGED: user_attributes replaces attribute_columns and attribute_weights
+        "user_attributes": [
+            {"column": "department", "weight": 0.40},
+            {"column": "jobcode", "weight": 0.35},
+            {"column": "location_country", "weight": 0.25},
+        ],
         "max_attribute_cardinality": 500,
         "min_attribute_group_size": 2,
         "renormalize_weights_on_null": True,

@@ -55,6 +55,7 @@ def cluster_entitlements_leiden(
         leiden_resolution: float = 1.0,
         leiden_random_seed: int = 42,
         min_entitlement_coverage: float = 0.5,
+        min_absolute_overlap: int = 2,
         max_clusters_per_user: int = 5,
         min_role_size: int = 10,
         use_sparse: bool = True,
@@ -69,6 +70,7 @@ def cluster_entitlements_leiden(
         leiden_resolution: Leiden granularity (0.5-2.0, higher=more clusters)
         leiden_random_seed: Random seed for reproducibility
         min_entitlement_coverage: User must have this % of cluster ents (0.3-0.8)
+        min_absolute_overlap: User must match at least this many cluster ents (floor)
         max_clusters_per_user: Max roles per user (1-10)
         min_role_size: Drop clusters with fewer users (5+)
         use_sparse: Use sparse matrix operations (required for 50K+ users)
@@ -139,7 +141,7 @@ def cluster_entitlements_leiden(
 
     logger.info(
         f"Leiden found {len(entitlement_clusters)} clusters "
-        f"(modularity={leiden_stats['modularity']:.3f})"
+        f"(cpm_quality={leiden_stats['cpm_quality']:.3f})"
     )
 
     # Step 4: Assign users to clusters (multi-membership)
@@ -148,6 +150,7 @@ def cluster_entitlements_leiden(
         matrix=matrix,
         entitlement_clusters=entitlement_clusters,
         min_coverage=min_entitlement_coverage,
+        min_absolute_overlap=min_absolute_overlap,
         max_clusters_per_user=max_clusters_per_user,
     )
 
@@ -390,7 +393,7 @@ def _run_leiden_clustering(
 
     # Compute stats
     leiden_stats = {
-        "modularity": float(partition.modularity),
+        "cpm_quality": float(partition.quality()),
         "resolution": resolution,
         "initial_clusters": len(partition),
         "graph_nodes": n_entitlements,
@@ -406,48 +409,87 @@ def _assign_users_to_clusters(
         matrix: pd.DataFrame,
         entitlement_clusters: Dict[int, List[str]],
         min_coverage: float,
+        min_absolute_overlap: int,
         max_clusters_per_user: int,
 ) -> Tuple[Dict[str, List[Dict]], Dict[int, int]]:
     """
     Assign users to clusters based on coverage threshold.
 
     Users can belong to multiple clusters (multi-membership).
+    Both conditions must be satisfied: coverage >= min_coverage AND
+    absolute overlap >= min_absolute_overlap. The floor prevents
+    single-entitlement matches from passing the percentage threshold
+    on small clusters.
+
+    Vectorized implementation: replaces O(n_users x n_clusters) Python loop
+    with sparse matrix multiplication O(nnz), where nnz is the number of
+    non-zero entries in the user-entitlement matrix (~460K for 50K users).
 
     Returns:
         user_memberships: {user_id: [{"cluster_id": X, "coverage": Y, ...}]}
         cluster_user_counts: {cluster_id: user_count}
     """
+    cluster_ids = sorted(entitlement_clusters.keys())
+    ent_index = {ent: i for i, ent in enumerate(matrix.columns)}
+    n_ents = len(matrix.columns)
+    n_clusters = len(cluster_ids)
+
+    # Build cluster indicator matrix: (n_clusters x n_ents), binary
+    # Row c has 1s at positions of cluster c's entitlements
+    cluster_sizes = np.zeros(n_clusters, dtype=np.int32)
+    rows, cols = [], []
+    for c_pos, cid in enumerate(cluster_ids):
+        for ent in entitlement_clusters[cid]:
+            if ent in ent_index:
+                rows.append(c_pos)
+                cols.append(ent_index[ent])
+        cluster_sizes[c_pos] = len([e for e in entitlement_clusters[cid] if e in ent_index])
+    cluster_matrix = csr_matrix(
+        (np.ones(len(rows), dtype=np.int32), (rows, cols)),
+        shape=(n_clusters, n_ents),
+    )
+
+    # Sparse user matrix: (n_users x n_ents)
+    user_matrix = csr_matrix(matrix.values.astype(np.int32))
+
+    # overlap[u, c] = number of cluster c entitlements user u holds
+    # shape: (n_users x n_clusters)
+    overlap = (user_matrix @ cluster_matrix.T).toarray()
+
+    # coverage[u, c] = overlap[u, c] / cluster_size[c]
+    # Avoid division by zero for empty clusters (shouldn't occur post-filtering)
+    safe_sizes = np.where(cluster_sizes > 0, cluster_sizes, 1)
+    coverage = overlap / safe_sizes[np.newaxis, :]
+
+    # Apply both thresholds
+    member_mask = (coverage >= min_coverage) & (overlap >= min_absolute_overlap)
+
+    # Build output dicts
+    user_ids = matrix.index.tolist()
     user_memberships = {}
-    cluster_user_counts = {cid: 0 for cid in entitlement_clusters.keys()}
+    cluster_user_counts = {cid: 0 for cid in cluster_ids}
 
-    for user_id in matrix.index:
-        # Get entitlements this user has
-        user_ents = set(matrix.columns[matrix.loc[user_id] == 1])
-
-        if not user_ents:
+    for u_pos, user_id in enumerate(user_ids):
+        qualifying = np.where(member_mask[u_pos])[0]
+        if len(qualifying) == 0:
             continue
 
+        # Sort by coverage descending, cap at max_clusters_per_user
+        qualifying = qualifying[np.argsort(-coverage[u_pos, qualifying])]
+        qualifying = qualifying[:max_clusters_per_user]
+
         memberships = []
+        for c_pos in qualifying:
+            cid = cluster_ids[c_pos]
+            memberships.append({
+                "cluster_id": cid,
+                "coverage": round(float(coverage[u_pos, c_pos]), 4),
+                "count": int(overlap[u_pos, c_pos]),
+                "total": int(cluster_sizes[c_pos]),
+            })
+            cluster_user_counts[cid] += 1
 
-        for cluster_id, cluster_ents in entitlement_clusters.items():
-            cluster_set = set(cluster_ents)
-
-            # Compute coverage
-            intersection = user_ents & cluster_set
-            coverage = len(intersection) / len(cluster_set)
-
-            if coverage >= min_coverage:
-                memberships.append({
-                    "cluster_id": cluster_id,
-                    "coverage": round(coverage, 4),
-                    "count": len(intersection),
-                    "total": len(cluster_set),
-                })
-                cluster_user_counts[cluster_id] += 1
-
-        # Sort by coverage (highest first), take top N
-        memberships.sort(key=lambda x: -x["coverage"])
-        user_memberships[user_id] = memberships[:max_clusters_per_user]
+        user_memberships[user_id] = memberships
 
     return user_memberships, cluster_user_counts
 
@@ -537,7 +579,7 @@ def _empty_clustering_result(matrix: pd.DataFrame) -> Dict[str, Any]:
         "user_cluster_membership": {},
         "cluster_metadata": {},
         "leiden_stats": {
-            "modularity": 0.0,
+            "cpm_quality": 0.0,
             "initial_clusters": 0,
             "graph_nodes": len(matrix.columns),
             "graph_edges": 0,
@@ -621,7 +663,7 @@ if __name__ == "__main__":
 
         print(f"\nClustering results:")
         print(f"  - Clusters: {result['n_clusters']}")
-        print(f"  - Modularity: {result['leiden_stats']['modularity']:.3f}")
+        print(f"  - CPM quality: {result['leiden_stats']['cpm_quality']:.3f}")
         print(f"  - Assigned users: {len(result['user_cluster_membership'])}/{n_users}")
         print(f"  - Unassigned users: {len(result['unassigned_users'])}")
 
