@@ -37,7 +37,6 @@ from typing import Dict, List, Any, Optional, Tuple
 import logging
 from collections import defaultdict
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -77,15 +76,15 @@ def _get_user_attribute_config(config: Dict[str, Any]) -> Tuple[List[str], Dict[
 # ============================================================================
 
 def score_assignments(
-    assignments_df: pd.DataFrame,
-    full_matrix: pd.DataFrame,
-    identities: pd.DataFrame,
-    cluster_result: Dict[str, Any],
-    roles: List[Dict],
-    birthright_entitlements: List[str],
-    noise_entitlements: List[str],
-    config: Dict[str, Any],
-    drift_data: Optional[Dict[str, Any]] = None,
+        assignments_df: pd.DataFrame,
+        full_matrix: pd.DataFrame,
+        identities: pd.DataFrame,
+        cluster_result: Dict[str, Any],
+        roles: List[Dict],
+        birthright_entitlements: List[str],
+        noise_entitlements: List[str],
+        config: Dict[str, Any],
+        drift_data: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """
     Score all user-entitlement assignments with multi-factor confidence.
@@ -146,6 +145,22 @@ def score_assignments(
         config=config,
     )
 
+    # Step 6: Merge user attributes for display in UI
+    logger.info("Step 6: Merging user attributes for UI display")
+    attr_columns, _ = _get_user_attribute_config(config)
+    if attr_columns and 'USR_ID' in identities.columns:
+        # Select only the configured attributes plus USR_ID for merging
+        cols_to_merge = ['USR_ID'] + [col for col in attr_columns if col in identities.columns]
+        identity_subset = identities[cols_to_merge].copy()
+
+        # Merge on USR_ID
+        enriched_df = enriched_df.merge(
+            identity_subset,
+            on='USR_ID',
+            how='left',
+            suffixes=('', '_identity')
+        )
+
     logger.info(
         f"Confidence scoring complete: "
         f"{(enriched_df['confidence_level'] == 'HIGH').sum()} HIGH, "
@@ -161,9 +176,9 @@ def score_assignments(
 # ============================================================================
 
 def _precompute_attribute_prevalence(
-    matrix: pd.DataFrame,
-    identities: pd.DataFrame,
-    config: Dict[str, Any],
+        matrix: pd.DataFrame,
+        identities: pd.DataFrame,
+        config: Dict[str, Any],
 ) -> Dict[Tuple[str, str, str], Dict[str, int]]:
     """
     Pre-compute prevalence of each entitlement within each attribute group.
@@ -242,7 +257,7 @@ def _precompute_attribute_prevalence(
 # ============================================================================
 
 def _build_entitlement_role_lookup(
-    roles: List[Dict],
+        roles: List[Dict],
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Build reverse mapping: entitlement_id -> list of roles containing it.
@@ -290,8 +305,8 @@ def _build_entitlement_role_lookup(
 # ============================================================================
 
 def _build_user_role_coverage(
-    roles: List[Dict],
-    cluster_result: Dict[str, Any],
+        roles: List[Dict],
+        cluster_result: Dict[str, Any],
 ) -> Dict[str, float]:
     """
     Build mapping: user_id → average role coverage.
@@ -321,17 +336,17 @@ def _build_user_role_coverage(
 # ============================================================================
 
 def _compute_individual_scores(
-    assignments_df: pd.DataFrame,
-    full_matrix: pd.DataFrame,
-    identities: pd.DataFrame,
-    ent_role_lookup: Dict[str, List[Dict[str, Any]]],
-    cluster_result: Dict[str, Any],
-    roles: List[Dict],
-    attribute_prevalence: Dict,
-    birthright_entitlements: List[str],
-    noise_entitlements: List[str],
-    drift_data: Optional[Dict],
-    config: Dict[str, Any],
+        assignments_df: pd.DataFrame,
+        full_matrix: pd.DataFrame,
+        identities: pd.DataFrame,
+        ent_role_lookup: Dict[str, List[Dict[str, Any]]],
+        cluster_result: Dict[str, Any],
+        roles: List[Dict],
+        attribute_prevalence: Dict,
+        birthright_entitlements: List[str],
+        noise_entitlements: List[str],
+        drift_data: Optional[Dict],
+        config: Dict[str, Any],
 ) -> pd.DataFrame:
     """
     Compute individual factor scores for each assignment.
@@ -361,9 +376,10 @@ def _compute_individual_scores(
     df["cluster_id"] = None
     df["cluster_size"] = 0
     df["peers_with_entitlement"] = 0
+    df["peer_users"] = ""  # Comma-separated list of peer user IDs
     df["role_covered"] = False
-    df["entitlement_tier"] = "residual"   # NEW: core/common/residual/birthright
-    df["matched_role_id"] = ""            # NEW: which role matched this entitlement
+    df["entitlement_tier"] = "residual"  # NEW: core/common/residual/birthright
+    df["matched_role_id"] = ""  # NEW: which role matched this entitlement
     df["attributes_skipped"] = ""
 
     # Peer group scores (now role-based)
@@ -407,12 +423,12 @@ def _compute_individual_scores(
 
 
 def _compute_peer_group_scores(
-    df: pd.DataFrame,
-    full_matrix: pd.DataFrame,
-    ent_role_lookup: Dict[str, List[Dict[str, Any]]],
-    cluster_result: Dict[str, Any],
-    birthright_entitlements: List[str],
-    ent_col: str,
+        df: pd.DataFrame,
+        full_matrix: pd.DataFrame,
+        ent_role_lookup: Dict[str, List[Dict[str, Any]]],
+        cluster_result: Dict[str, Any],
+        birthright_entitlements: List[str],
+        ent_col: str,
 ) -> pd.DataFrame:
     """
     Compute peer group prevalence scores using role-based peer groups.
@@ -492,6 +508,11 @@ def _compute_peer_group_scores(
         df.at[idx, "cluster_size"] = member_count
         df.at[idx, "role_covered"] = True
 
+        # Get list of peer users (all members of this role except current user)
+        peer_user_list = [m for m in best["members"] if m != user_id]
+        # Limit to first 100 peers to avoid huge strings
+        df.at[idx, "peer_users"] = ",".join(peer_user_list[:100])
+
         # Leave-one-out peer score
         if member_count <= 1:
             df.at[idx, "peer_group_score"] = 0.0
@@ -514,12 +535,12 @@ def _compute_peer_group_scores(
 
 
 def _compute_attribute_scores(
-    df: pd.DataFrame,
-    identities: pd.DataFrame,
-    full_matrix: pd.DataFrame,
-    attribute_prevalence: Dict,
-    config: Dict[str, Any],
-    ent_col: str,
+        df: pd.DataFrame,
+        identities: pd.DataFrame,
+        full_matrix: pd.DataFrame,
+        attribute_prevalence: Dict,
+        config: Dict[str, Any],
+        ent_col: str,
 ) -> pd.DataFrame:
     """
     Compute user attribute prevalence scores.
@@ -580,9 +601,9 @@ def _compute_attribute_scores(
 
 
 def _compute_drift_stability_scores(
-    df: pd.DataFrame,
-    drift_data: Dict[str, Any],
-    ent_col: str,
+        df: pd.DataFrame,
+        drift_data: Dict[str, Any],
+        ent_col: str,
 ) -> pd.DataFrame:
     """
     Compute drift stability scores.
@@ -599,11 +620,11 @@ def _compute_drift_stability_scores(
 
 
 def _compute_role_covered(
-    df: pd.DataFrame,
-    roles: List[Dict],
-    cluster_result: Dict[str, Any],
-    birthright_entitlements: List[str],
-    ent_col: str,
+        df: pd.DataFrame,
+        roles: List[Dict],
+        cluster_result: Dict[str, Any],
+        birthright_entitlements: List[str],
+        ent_col: str,
 ) -> pd.DataFrame:
     """
     Determine if entitlement is covered by user's assigned roles or birthright.
@@ -624,9 +645,9 @@ def _compute_role_covered(
 # ============================================================================
 
 def _compute_weighted_confidence(
-    scores_df: pd.DataFrame,
-    user_role_coverage: Dict[str, float],
-    config: Dict[str, Any],
+        scores_df: pd.DataFrame,
+        user_role_coverage: Dict[str, float],
+        config: Dict[str, Any],
 ) -> pd.DataFrame:
     """
     Compute weighted confidence from individual factor scores.
@@ -698,8 +719,10 @@ def _compute_weighted_confidence(
         if use_drift and pd.notna(row["drift_stability_score"]):
             available_scores["drift_stability"] = row["drift_stability_score"]
 
-        # Role coverage
-        if use_role_cov and user_id in user_role_coverage:
+        # Role coverage — only for non-residual entitlements.
+        # Residuals have peer_group_score=0.0 by definition; adding a user-level
+        # coverage bonus here would inflate confidence on outlier entitlements.
+        if use_role_cov and user_id in user_role_coverage and row.get("entitlement_tier") != "residual":
             available_scores["role_coverage"] = user_role_coverage[user_id]
 
         # Compute weighted confidence
@@ -759,10 +782,10 @@ def _compute_weighted_confidence(
 
 
 def _build_justification(
-    confidence: float,
-    available_scores: Dict[str, float],
-    weights_used: Dict[str, float],
-    row: pd.Series,
+        confidence: float,
+        available_scores: Dict[str, float],
+        weights_used: Dict[str, float],
+        row: pd.Series,
 ) -> str:
     """
     Build human-readable justification for confidence score.
@@ -827,10 +850,10 @@ def _build_justification(
 # ============================================================================
 
 def generate_recommendations(
-    enriched_assignments: pd.DataFrame,
-    full_matrix: pd.DataFrame,
-    cluster_result: Dict[str, Any],
-    config: Dict[str, Any],
+        enriched_assignments: pd.DataFrame,
+        full_matrix: pd.DataFrame,
+        cluster_result: Dict[str, Any],
+        config: Dict[str, Any],
 ) -> pd.DataFrame:
     """
     Generate access recommendations (missing entitlements).
@@ -844,8 +867,8 @@ def generate_recommendations(
 
 
 def detect_over_provisioned(
-    enriched_assignments: pd.DataFrame,
-    revocation_threshold: float,
+        enriched_assignments: pd.DataFrame,
+        revocation_threshold: float,
 ) -> pd.DataFrame:
     """
     Detect over-provisioned access (revocation candidates).
@@ -866,6 +889,7 @@ def detect_over_provisioned(
 
     return result
 
+
 # ---------------------------------------------------------------------------
 # Save / load cluster assignments for stability tracking
 # ---------------------------------------------------------------------------
@@ -878,15 +902,14 @@ def save_cluster_assignments(cluster_labels: pd.Series, path: str):
         json.dump(data, f)
 
 
-
 # ============================================================================
 # SUMMARY STATISTICS
 # ============================================================================
 
 def build_scoring_summary(
-    enriched_assignments: pd.DataFrame,
-    cluster_result: Dict[str, Any],
-    birthright_entitlements: List[str],
+        enriched_assignments: pd.DataFrame,
+        cluster_result: Dict[str, Any],
+        birthright_entitlements: List[str],
 ) -> Dict[str, Any]:
     """Build summary statistics for confidence scoring."""
     user_memberships = cluster_result["user_cluster_membership"]
@@ -927,6 +950,7 @@ def build_scoring_summary(
 
 if __name__ == "__main__":
     import sys
+
     sys.path.insert(0, '/home/claude')
 
     print("Confidence Scorer V2 - Example Usage")

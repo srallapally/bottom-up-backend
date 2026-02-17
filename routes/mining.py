@@ -245,7 +245,7 @@ def mine_v2(session_id):
 
     logger.info(
         f"Leiden clustering complete: {cluster_result['n_clusters']} clusters, "
-        f"modularity={cluster_result['leiden_stats']['modularity']:.3f}"
+        f"cpm_quality={cluster_result['leiden_stats']['cpm_quality']:.3f}"
     )
 
     # Step 6: Build roles from clusters (V2)
