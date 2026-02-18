@@ -41,6 +41,123 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# SPARSE MATRIX ACCESSOR
+# Wraps scipy.sparse.csr_matrix to expose the three operations used by the
+# scorer, replacing pd.DataFrame(matrix.toarray(), ...) in mining.py.
+# ============================================================================
+
+class SparseMatrixAccessor:
+    """
+    Thin wrapper around a CSR matrix that exposes the DataFrame-like operations
+    used by the confidence scorer, without ever densifying the full matrix.
+
+    Supported operations (mirrors the DataFrame API used in this file):
+      accessor.sum(axis=0)                -> np.ndarray (n_ents,)
+      accessor.loc[user_ids].sum(axis=0)  -> np.ndarray (n_ents,)  [row subset sum]
+      accessor.at[user_id, ent_id]        -> int  [point lookup]
+      len(accessor)                        -> n_users
+      accessor.index                       -> user_ids list (for compatibility checks)
+      accessor.columns                     -> ent_ids list
+    """
+
+    def __init__(self, matrix, user_ids, ent_ids):
+        """
+        Args:
+            matrix: scipy.sparse.csr_matrix (n_users × n_ents)
+            user_ids: array-like of user ID strings (row labels)
+            ent_ids:  array-like of entitlement ID strings (column labels)
+        """
+        import scipy.sparse as _sp
+        if not _sp.issparse(matrix):
+            raise TypeError("SparseMatrixAccessor requires a scipy sparse matrix")
+        self._matrix = matrix.tocsr()
+        self._user_ids = list(user_ids)
+        self._ent_ids = list(ent_ids)
+        self._user_idx = {uid: i for i, uid in enumerate(self._user_ids)}
+        self._ent_idx = {eid: i for i, eid in enumerate(self._ent_ids)}
+
+    # ---- DataFrame-compatible properties ----
+
+    @property
+    def index(self):
+        return self._user_ids
+
+    @property
+    def columns(self):
+        return self._ent_ids
+
+    def __len__(self):
+        return self._matrix.shape[0]
+
+    # ---- Operations used by the scorer ----
+
+    def sum(self, axis=0):
+        """Column sums (axis=0) as a pandas Series for .map() compatibility."""
+        result = np.asarray(self._matrix.sum(axis=0)).flatten()
+        return pd.Series(result, index=self._ent_ids)
+
+    def at(self, user_id, ent_id):
+        """Scalar point lookup without densifying."""
+        u = self._user_idx.get(user_id)
+        e = self._ent_idx.get(ent_id)
+        if u is None or e is None:
+            return 0
+        return int(self._matrix[u, e])
+
+    class _LocAccessor:
+        """Minimal .loc[list_of_user_ids] returning a _RowSubset."""
+
+        def __init__(self, accessor):
+            self._acc = accessor
+
+        def __getitem__(self, user_ids):
+            if isinstance(user_ids, str):
+                user_ids = [user_ids]
+            indices = [self._acc._user_idx[uid] for uid in user_ids
+                       if uid in self._acc._user_idx]
+            if not indices:
+                return _EmptyRowSubset(self._acc._ent_ids)
+            rows = self._acc._matrix[indices, :]
+            return _RowSubset(rows, self._acc._ent_ids)
+
+    @property
+    def loc(self):
+        return self._LocAccessor(self)
+
+
+class _RowSubset:
+    """Result of SparseMatrixAccessor.loc[user_ids] — supports .sum(axis=0)."""
+
+    def __init__(self, rows, ent_ids):
+        self._rows = rows
+        self._ent_ids = ent_ids
+
+    def sum(self, axis=0):
+        result = np.asarray(self._rows.sum(axis=0)).flatten()
+        return pd.Series(result, index=self._ent_ids)
+
+
+class _EmptyRowSubset:
+    """Sentinel for when no requested user IDs exist in the matrix."""
+
+    def __init__(self, ent_ids):
+        self._ent_ids = ent_ids
+
+    def sum(self, axis=0):
+        return pd.Series(0, index=self._ent_ids)
+
+
+def _matrix_at(matrix, user_id, ent_id) -> int:
+    """Scalar point lookup that works for both DataFrame and SparseMatrixAccessor."""
+    if isinstance(matrix, SparseMatrixAccessor):
+        return matrix.at(user_id, ent_id)
+    # DataFrame path
+    if ent_id in matrix.columns and user_id in matrix.index:
+        return int(matrix.at[user_id, ent_id])
+    return 0
+
+
+# ============================================================================
 # ADDED: Helper to extract user attribute config from plain config dict
 # ============================================================================
 
@@ -161,12 +278,54 @@ def score_assignments(
             suffixes=('', '_identity')
         )
 
+    # FIX 3 (2026-02-17): Add calibration statistics
+    # Validate that HIGH confidence correlates with core/birthright, not residuals
+    calibration_stats = {}
+    if "entitlement_tier" in enriched_df.columns:
+        for level in ["HIGH", "MEDIUM", "LOW"]:
+            level_mask = enriched_df["confidence_level"] == level
+            level_total = level_mask.sum()
+
+            if level_total > 0:
+                calibration_stats[f"{level}_total"] = int(level_total)
+                calibration_stats[f"{level}_in_core"] = int(
+                    ((level_mask) & (enriched_df["entitlement_tier"] == "core")).sum()
+                )
+                calibration_stats[f"{level}_in_common"] = int(
+                    ((level_mask) & (enriched_df["entitlement_tier"] == "common")).sum()
+                )
+                calibration_stats[f"{level}_in_birthright"] = int(
+                    ((level_mask) & (enriched_df["entitlement_tier"] == "birthright")).sum()
+                )
+                calibration_stats[f"{level}_in_residual"] = int(
+                    ((level_mask) & (enriched_df["entitlement_tier"] == "residual")).sum()
+                )
+
+                # Calculate percentages for validation
+                calibration_stats[f"{level}_core_pct"] = round(
+                    calibration_stats[f"{level}_in_core"] / level_total * 100, 1
+                )
+                calibration_stats[f"{level}_residual_pct"] = round(
+                    calibration_stats[f"{level}_in_residual"] / level_total * 100, 1
+                )
+
     logger.info(
         f"Confidence scoring complete: "
         f"{(enriched_df['confidence_level'] == 'HIGH').sum()} HIGH, "
         f"{(enriched_df['confidence_level'] == 'MEDIUM').sum()} MEDIUM, "
         f"{(enriched_df['confidence_level'] == 'LOW').sum()} LOW"
     )
+
+    # FIX 3 (2026-02-17): Log calibration stats for validation
+    if calibration_stats:
+        logger.info(
+            f"Calibration check - HIGH: {calibration_stats.get('HIGH_core_pct', 0):.1f}% core, "
+            f"{calibration_stats.get('HIGH_residual_pct', 0):.1f}% residual | "
+            f"LOW: {calibration_stats.get('LOW_core_pct', 0):.1f}% core, "
+            f"{calibration_stats.get('LOW_residual_pct', 0):.1f}% residual"
+        )
+        # Store in DataFrame for potential export
+        enriched_df.attrs['calibration_stats'] = calibration_stats
 
     return enriched_df
 
@@ -227,7 +386,7 @@ def _precompute_attribute_prevalence(
             user_ids = group_df["USR_ID"].tolist()
             total_users = len(user_ids)
 
-            # Vectorized: count entitlements per user in this group
+            # Sum entitlement counts for this attribute group
             ent_sums = matrix.loc[user_ids].sum(axis=0)
 
             for ent_id, count in ent_sums.items():
@@ -522,7 +681,7 @@ def _compute_peer_group_scores(
         if ent_sums is None or ent_id not in ent_sums.index:
             continue
 
-        user_has = full_matrix.at[user_id, ent_id] if ent_id in full_matrix.columns else 0
+        user_has = _matrix_at(full_matrix, user_id, ent_id)
         peers_with = int(ent_sums[ent_id] - user_has)
         peer_count = member_count - 1
 
@@ -587,7 +746,7 @@ def _compute_attribute_scores(
             with_ent = prev_data["users_with_ent"]
 
             # Leave-one-out correction
-            if full_matrix.at[user_id, ent_id] if ent_id in full_matrix.columns else 0:
+            if _matrix_at(full_matrix, user_id, ent_id):
                 with_ent -= 1
                 total -= 1
 
@@ -683,9 +842,15 @@ def _compute_weighted_confidence(
     #
     # Strategy: peer_group = 0.40, extra factors take their configured weight,
     # attribute weights are scaled to fill (1.0 - 0.40 - extra_weights)
+    # FIX 1 (2026-02-17): Cap attributes at 30% to prevent HR bias from dominating scoring
+    MAX_ATTR_WEIGHT = 0.30  # Attributes should be tie-breaker, not primary signal
+
     peer_group_base_weight = config.get("peer_group_weight", 0.40)
     extra_weight_total = drift_weight + role_cov_weight
-    attr_budget = max(0.0, 1.0 - peer_group_base_weight - extra_weight_total)
+    attr_budget = min(
+        max(0.0, 1.0 - peer_group_base_weight - extra_weight_total),
+        MAX_ATTR_WEIGHT  # FIX 1: Hard cap on attribute weight
+    )
 
     # Scale customer's attribute weights to fit within attr_budget
     base_weights = {"peer_group": peer_group_base_weight}

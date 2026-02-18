@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def build_roles(
-        matrix: pd.DataFrame,
+        matrix,  # CHANGE 2026-02-17: Now csr_matrix
+        user_ids,  # CHANGE 2026-02-17: User IDs (row labels)
+        ent_ids,  # CHANGE 2026-02-17: Entitlement IDs (column labels)
         cluster_result: Dict[str, Any],
         birthright_result: Dict[str, Any],
         identities: pd.DataFrame,
@@ -46,8 +48,12 @@ def build_roles(
     """
     Build role definitions from entitlement clusters with two-tier prevalence.
 
+    CHANGE 2026-02-17: Updated to work with sparse matrix + indices.
+
     Args:
-        matrix: Full user x entitlement matrix (before birthright filtering)
+        matrix: scipy.sparse.csr_matrix (users × entitlements)
+        user_ids: array-like of user IDs (row labels)
+        ent_ids: array-like of entitlement IDs (column labels)
         cluster_result: Output from cluster_entitlements_leiden()
         birthright_result: Output from detect_birthright()
         identities: User HR attributes DataFrame
@@ -139,7 +145,8 @@ def build_roles(
 
     # ---- Step 2-3: Sparse prevalence computation ----
     logger.info("Step 2-3: Computing prevalence via sparse matrix multiply")
-    prevalence_df = _compute_prevalence_matrix(roles, matrix, excluded_ents)
+    # CHANGE 2026-02-17: Pass user_ids and ent_ids
+    prevalence_df = _compute_prevalence_matrix(roles, matrix, user_ids, ent_ids, excluded_ents)
 
     # ---- Step 4: Classify entitlements into tiers ----
     logger.info("Step 4: Classifying entitlements into core/common tiers")
@@ -177,8 +184,11 @@ def build_roles(
 
     # ---- Step 8: Residuals against expanded core sets ----
     logger.info("Step 8: Computing residual access against core entitlement sets")
+    # CHANGE 2026-02-17: Pass user_ids and ent_ids
     residuals = _compute_residuals_v2(
         matrix=matrix,
+        user_ids=user_ids,
+        ent_ids=ent_ids,
         roles=roles,
         user_memberships=user_memberships,
         birthright_entitlements=list(birthright_ents),
@@ -204,6 +214,7 @@ def build_roles(
         birthright_result=birthright_result,
         residuals=residuals,
         matrix=matrix,
+        user_ids=user_ids,  # CHANGE 2026-02-17
     )
 
     total_filtered = filtered_clusters["low_entitlements"] + filtered_clusters["zero_members"]
@@ -239,10 +250,12 @@ def build_roles(
 # ============================================================================
 
 def _compute_prevalence_matrix(
-    roles: List[Dict],
-    matrix: pd.DataFrame,
-    excluded_ents: set,
-) -> pd.DataFrame:
+        roles: List[Dict],
+        matrix,  # CHANGE 2026-02-17: Now csr_matrix
+        user_ids,  # CHANGE 2026-02-17: User IDs
+        ent_ids,  # CHANGE 2026-02-17: Entitlement IDs
+        excluded_ents: set,
+) -> Dict[str, Any]:
     """
     Compute prevalence of every entitlement across every role using sparse
     matrix multiply (Option 3 from design spec).
@@ -250,19 +263,27 @@ def _compute_prevalence_matrix(
     Operation: prevalence = (R.T @ M) / role_sizes
     Where R is a sparse (users x roles) membership matrix.
 
-    Returns:
-        DataFrame shape (n_roles, n_entitlements) with prevalence values 0.0-1.0.
-        Index = role_id, columns = entitlement IDs.
-        Excluded entitlements (birthright + noise) have prevalence = 0.
+    Returns a dict so the result stays sparse (never densifies n_roles x n_ents):
+        {
+            "prevalence_csr": csr_matrix (n_roles x n_ents),  # values in [0, 1]
+            "role_id_to_row": {role_id: row_index},
+            "ent_id_to_col": {ent_id: col_index},
+            "ent_ids": list[str],
+        }
+    Excluded entitlements (birthright + noise) have prevalence = 0 (dropped).
     """
     if not roles:
-        return pd.DataFrame()
+        return {
+            "prevalence_csr": sp.csr_matrix((0, 0)),
+            "role_id_to_row": {},
+            "ent_id_to_col": {},
+            "ent_ids": [],
+        }
 
-    all_users = list(matrix.index)
-    all_ents = list(matrix.columns)
+    all_users = list(user_ids)
+    all_ents = list(ent_ids)
     user_idx = {uid: i for i, uid in enumerate(all_users)}
     n_users = len(all_users)
-    n_ents = len(all_ents)
     n_roles = len(roles)
 
     # Build sparse membership matrix R (users x roles)
@@ -279,42 +300,41 @@ def _compute_prevalence_matrix(
         shape=(n_users, n_roles),
     )
 
-    # Convert matrix M to sparse if it isn't already
-    M = sp.csr_matrix(matrix.values.astype(np.float64))
+    M = matrix.astype(np.float64)
 
-    # counts = R.T @ M  -> (n_roles x n_ents)
-    counts = R.T @ M
+    # counts[r, e] = number of role-r members that hold entitlement e
+    counts = (R.T @ M).tocsr()  # (n_roles x n_ents), stays sparse
 
-    # role_sizes = R.sum(axis=0) -> (1 x n_roles), reshape for broadcasting
+    # Scale each row by 1/role_size to get prevalence — no densification
     role_sizes = np.asarray(R.sum(axis=0)).flatten()  # (n_roles,)
+    safe_sizes = np.where(role_sizes > 0, role_sizes, 1.0)
 
-    # prevalence = counts / role_sizes (avoid div by zero)
-    # counts is sparse, convert to dense for division
-    counts_dense = np.asarray(counts.todense())
-    with np.errstate(divide='ignore', invalid='ignore'):
-        prevalence_values = np.where(
-            role_sizes[:, np.newaxis] > 0,
-            counts_dense / role_sizes[:, np.newaxis],
-            0.0,
-        )
+    prevalence_csr = counts.copy()
+    for r in range(n_roles):
+        start = prevalence_csr.indptr[r]
+        end = prevalence_csr.indptr[r + 1]
+        if start < end:
+            prevalence_csr.data[start:end] /= safe_sizes[r]
 
-    # Zero out excluded entitlements
-    excluded_mask = np.array([ent in excluded_ents for ent in all_ents])
-    prevalence_values[:, excluded_mask] = 0.0
-
-    role_ids = [r["role_id"] for r in roles]
-    prevalence_df = pd.DataFrame(
-        prevalence_values,
-        index=role_ids,
-        columns=all_ents,
-    )
+    # Zero out excluded entitlements by dropping their entries
+    ent_id_to_col = {eid: i for i, eid in enumerate(all_ents)}
+    excluded_cols = {ent_id_to_col[e] for e in excluded_ents if e in ent_id_to_col}
+    if excluded_cols:
+        mask = np.isin(prevalence_csr.indices, list(excluded_cols))
+        prevalence_csr.data[mask] = 0.0
+        prevalence_csr.eliminate_zeros()
 
     logger.info(
-        f"Prevalence matrix: {prevalence_df.shape[0]} roles x {prevalence_df.shape[1]} entitlements "
-        f"({(prevalence_values > 0).sum()} nonzero cells)"
+        f"Prevalence matrix: {n_roles} roles x {len(all_ents)} entitlements "
+        f"({prevalence_csr.nnz} nonzero cells)"
     )
 
-    return prevalence_df
+    return {
+        "prevalence_csr": prevalence_csr,
+        "role_id_to_row": {r["role_id"]: i for i, r in enumerate(roles)},
+        "ent_id_to_col": ent_id_to_col,
+        "ent_ids": all_ents,
+    }
 
 
 # ============================================================================
@@ -322,9 +342,9 @@ def _compute_prevalence_matrix(
 # ============================================================================
 
 def _classify_entitlement_tiers(
-    roles: List[Dict],
-    prevalence_df: pd.DataFrame,
-    config: Dict[str, Any],
+        roles: List[Dict],
+        prevalence_data: Dict[str, Any],
+        config: Dict[str, Any],
 ) -> None:
     """
     Classify entitlements into core/common tiers for each role.
@@ -340,39 +360,46 @@ def _classify_entitlement_tiers(
     prevalence_threshold = config.get("entitlement_prevalence_threshold", 0.75)
     association_threshold = config.get("entitlement_association_threshold", 0.40)
 
+    prevalence_csr = prevalence_data["prevalence_csr"]
+    role_id_to_row = prevalence_data["role_id_to_row"]
+    ent_ids = prevalence_data["ent_ids"]
+
     for role in roles:
         role_id = role["role_id"]
         seed_set = set(role["seed_entitlements"])
 
-        if role_id not in prevalence_df.index:
+        if role_id not in role_id_to_row:
             role["core_entitlements"] = list(seed_set)
             role["common_entitlements"] = []
             role["entitlement_prevalence"] = {}
             role["low_prevalence_seeds"] = []
             continue
 
-        role_prevalence = prevalence_df.loc[role_id]
+        row_idx = role_id_to_row[role_id]
 
-        core = set(seed_set)  # Seeds are always core
+        # Read nonzero entries for this role directly from CSR without densifying
+        start = prevalence_csr.indptr[row_idx]
+        end = prevalence_csr.indptr[row_idx + 1]
+        col_indices = prevalence_csr.indices[start:end]
+        prev_values = prevalence_csr.data[start:end]
+
+        core = set(seed_set)
         common = []
         low_prevalence_seeds = []
         ent_prevalence_dict = {}
 
-        # Scan all entitlements with nonzero prevalence for this role
-        nonzero = role_prevalence[role_prevalence > 0]
-
-        for ent_id, prev in nonzero.items():
+        for col_idx, prev in zip(col_indices, prev_values):
+            if prev <= 0:
+                continue
+            ent_id = ent_ids[col_idx]
             if ent_id in seed_set:
-                # Seed entitlement: always core, flag if low prevalence
                 ent_prevalence_dict[ent_id] = round(float(prev), 4)
                 if prev < prevalence_threshold:
                     low_prevalence_seeds.append(ent_id)
             elif prev >= prevalence_threshold:
-                # Non-seed, high prevalence: promote to core
                 core.add(ent_id)
                 ent_prevalence_dict[ent_id] = round(float(prev), 4)
             elif prev >= association_threshold:
-                # Non-seed, mid prevalence: common tier
                 common.append(ent_id)
                 ent_prevalence_dict[ent_id] = round(float(prev), 4)
 
@@ -381,7 +408,6 @@ def _classify_entitlement_tiers(
         role["entitlement_prevalence"] = ent_prevalence_dict
         role["low_prevalence_seeds"] = sorted(low_prevalence_seeds)
 
-    # Log tier stats
     total_core = sum(len(r["core_entitlements"]) for r in roles)
     total_common = sum(len(r["common_entitlements"]) for r in roles)
     total_seeds = sum(len(r["seed_entitlements"]) for r in roles)
@@ -398,8 +424,8 @@ def _classify_entitlement_tiers(
 # ============================================================================
 
 def _detect_birthright_promotions(
-    roles: List[Dict],
-    config: Dict[str, Any],
+        roles: List[Dict],
+        config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """
     Detect entitlements that are core in a high percentage of all roles.
@@ -441,8 +467,8 @@ def _detect_birthright_promotions(
 # ============================================================================
 
 def _compute_role_overlap(
-    roles: List[Dict],
-    config: Dict[str, Any],
+        roles: List[Dict],
+        config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     """
     Compute Jaccard similarity of core entitlement sets between all role pairs.
@@ -491,9 +517,9 @@ def _compute_role_overlap(
 # ============================================================================
 
 def _summarize_hr_attributes(
-    members: List[str],
-    identities: pd.DataFrame,
-    config: Dict[str, Any],
+        members: List[str],
+        identities: pd.DataFrame,
+        config: Dict[str, Any],
 ) -> Dict[str, List[Dict]]:
     """
     Summarize top attribute values for role members.
@@ -635,13 +661,17 @@ def _build_birthright_role(
 # ============================================================================
 
 def _compute_residuals_v2(
-        matrix: pd.DataFrame,
+        matrix,  # CHANGE 2026-02-17: Now csr_matrix
+        user_ids,  # CHANGE 2026-02-17: User IDs
+        ent_ids,  # CHANGE 2026-02-17: Entitlement IDs
         roles: List[Dict],
         user_memberships: Dict[str, List[Dict]],
         birthright_entitlements: List[str],
 ) -> List[Dict[str, str]]:
     """
     Compute residual access (entitlements not covered by roles or birthright).
+
+    CHANGE 2026-02-17: Updated to work with sparse matrix + indices.
 
     Uses core_entitlements (expanded) for coverage check.
     Multi-cluster membership means UNION of all assigned roles' core sets.
@@ -653,6 +683,9 @@ def _compute_residuals_v2(
 
     birthright_set = set(birthright_entitlements)
 
+    user_idx_map = {uid: i for i, uid in enumerate(user_ids)}
+    ent_ids_array = np.array(ent_ids)
+
     residuals = []
 
     for user_id, memberships in user_memberships.items():
@@ -663,18 +696,31 @@ def _compute_residuals_v2(
             covered_by_roles.update(core_ents)
 
         total_covered = covered_by_roles | birthright_set
-        user_ents = set(matrix.columns[matrix.loc[user_id] == 1])
+
+        if user_id in user_idx_map:
+            u = user_idx_map[user_id]
+            start, end = matrix.indptr[u], matrix.indptr[u + 1]
+            user_ents = set(ent_ids_array[matrix.indices[start:end]])
+        else:
+            user_ents = set()
+
         residual_ents = user_ents - total_covered
 
         for ent_id in residual_ents:
             residuals.append({"USR_ID": user_id, "entitlement_id": ent_id})
 
     # Users with NO cluster membership
-    all_users = set(matrix.index)
+    # CHANGE 2026-02-17: Use user_ids parameter instead of matrix.index
+    all_users = set(user_ids)
     assigned_users = set(user_memberships.keys())
 
     for user_id in (all_users - assigned_users):
-        user_ents = set(matrix.columns[matrix.loc[user_id] == 1])
+        if user_id in user_idx_map:
+            u = user_idx_map[user_id]
+            start, end = matrix.indptr[u], matrix.indptr[u + 1]
+            user_ents = set(ent_ids_array[matrix.indices[start:end]])
+        else:
+            user_ents = set()
         residual_ents = user_ents - birthright_set
 
         for ent_id in residual_ents:
@@ -736,10 +782,16 @@ def _build_summary(
         user_memberships: Dict[str, List[Dict]],
         birthright_result: Dict[str, Any],
         residuals: List[Dict],
-        matrix: pd.DataFrame,
+        matrix,  # CHANGE 2026-02-17: Now csr_matrix
+        user_ids,  # CHANGE 2026-02-17: User IDs for counting
 ) -> Dict[str, Any]:
-    """Build overall summary statistics."""
-    total_users = len(matrix)
+    """
+    Build overall summary statistics.
+
+    CHANGE 2026-02-17: Updated to work with sparse matrix.
+    """
+    # CHANGE 2026-02-17: Use matrix.shape[0] instead of len(matrix)
+    total_users = matrix.shape[0]
     assigned_users = len(user_memberships)
 
     multi_cluster_users = sum(

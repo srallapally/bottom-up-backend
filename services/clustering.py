@@ -49,7 +49,9 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def cluster_entitlements_leiden(
-        matrix: pd.DataFrame,
+        matrix,  # CHANGE 2026-02-17: Now accepts csr_matrix
+        ent_ids,  # CHANGE 2026-02-17: Entitlement IDs (column labels)
+        user_ids,  # CHANGE 2026-02-17: User IDs (row labels)
         leiden_min_similarity: float = 0.3,
         leiden_min_shared_users: int = 3,
         leiden_resolution: float = 1.0,
@@ -59,12 +61,18 @@ def cluster_entitlements_leiden(
         max_clusters_per_user: int = 5,
         min_role_size: int = 10,
         use_sparse: bool = True,
+        graph_max_neighbors_per_node: int = 500,  # NEW: cap incident edges per entitlement node
+        graph_max_entitlement_frequency_pct: float = 0.95,  # NEW: skip edges for entitlements held by >X% users
 ) -> Dict[str, Any]:
     """
     Bottom-up role mining via Leiden clustering on entitlement co-occurrence.
 
+    CHANGE 2026-02-17: Now accepts sparse matrix + indices instead of DataFrame.
+
     Args:
-        matrix: User × Entitlement binary matrix (users=rows, ents=cols)
+        matrix: scipy.sparse.csr_matrix (users × entitlements) binary matrix
+        ent_ids: array-like of entitlement IDs (column labels)
+        user_ids: array-like of user IDs (row labels)
         leiden_min_similarity: Jaccard threshold for graph edges (0.2-0.7)
         leiden_min_shared_users: Min users sharing entitlements for edge (2+)
         leiden_resolution: Leiden granularity (0.5-2.0, higher=more clusters)
@@ -74,6 +82,8 @@ def cluster_entitlements_leiden(
         max_clusters_per_user: Max roles per user (1-10)
         min_role_size: Drop clusters with fewer users (5+)
         use_sparse: Use sparse matrix operations (required for 50K+ users)
+        graph_max_neighbors_per_node: Max incident edges per entitlement node (caps graph density)
+        graph_max_entitlement_frequency_pct: Skip edge-building for entitlements held by >X% of users
 
     Returns:
         dict with:
@@ -100,18 +110,23 @@ def cluster_entitlements_leiden(
         leiden_min_shared_users=leiden_min_shared_users,
         leiden_resolution=leiden_resolution,
         min_entitlement_coverage=min_entitlement_coverage,
+        min_absolute_overlap=min_absolute_overlap,
         max_clusters_per_user=max_clusters_per_user,
         min_role_size=min_role_size,
+        graph_max_neighbors_per_node=graph_max_neighbors_per_node,
+        graph_max_entitlement_frequency_pct=graph_max_entitlement_frequency_pct,
     )
 
+    # CHANGE 2026-02-17: Calculate sparsity from sparse matrix
     logger.info(
         f"Starting Leiden clustering: {matrix.shape[0]} users, "
-        f"{matrix.shape[1]} entitlements, sparsity={1 - matrix.values.mean():.4f}"
+        f"{matrix.shape[1]} entitlements, sparsity={1 - matrix.nnz / (matrix.shape[0] * matrix.shape[1]):.4f}"
     )
 
     # Step 1: Transpose matrix (entitlements × users)
     logger.info("Step 1: Transposing matrix (entitlements become rows)")
-    ent_matrix = _transpose_to_sparse(matrix) if use_sparse else matrix.T
+    # CHANGE 2026-02-17: Matrix is already sparse, just transpose
+    ent_matrix = matrix.T if use_sparse else matrix.T
 
     # Step 2: Build Jaccard similarity graph
     logger.info("Step 2: Building Jaccard similarity graph")
@@ -119,24 +134,48 @@ def cluster_entitlements_leiden(
         ent_matrix=ent_matrix,
         min_similarity=leiden_min_similarity,
         min_shared_users=leiden_min_shared_users,
-        entitlement_ids=matrix.columns.tolist(),
+        entitlement_ids=ent_ids,  # CHANGE 2026-02-17: Use ent_ids parameter
+        max_neighbors_per_node=graph_max_neighbors_per_node,
+        max_entitlement_frequency_pct=graph_max_entitlement_frequency_pct,
     )
+
+
+    # Diagnostics: summarize graph degree distribution (helps tune min_similarity/min_shared and sparsification knobs)
+    # Note: degree stats are computed from the final edge list (after any gating / neighbor capping).
+    degrees = np.zeros(len(ent_ids), dtype=np.int32)
+    for a, b in edges:
+        degrees[a] += 1
+        degrees[b] += 1
+    if len(ent_ids) > 0:
+        isolated = int(np.sum(degrees == 0))
+        # Percentiles over non-zero degrees are more informative; fall back to 0s if all isolated.
+        nonzero = degrees[degrees > 0]
+        if nonzero.size > 0:
+            p50, p90, p99 = np.percentile(nonzero, [50, 90, 99])
+            logger.info(
+                f"Graph degree stats (nonzero): min={int(nonzero.min())} "
+                f"p50={int(p50)} p90={int(p90)} p99={int(p99)} max={int(nonzero.max())}; "
+                f"isolated_nodes={isolated}"
+            )
+        else:
+            logger.info(f"Graph degree stats: all nodes isolated (isolated_nodes={isolated})")
 
     if len(edges) == 0:
         logger.warning("No edges in graph - data too sparse or thresholds too strict")
-        return _empty_clustering_result(matrix)
+        # CHANGE 2026-02-17: Pass user_ids and ent_ids to _empty_clustering_result
+        return _empty_clustering_result(matrix, user_ids, ent_ids)
 
-    logger.info(f"Graph: {len(matrix.columns)} nodes, {len(edges)} edges")
+    logger.info(f"Graph: {len(ent_ids)} nodes, {len(edges)} edges")  # CHANGE 2026-02-17
 
     # Step 3: Run Leiden clustering
     logger.info("Step 3: Running Leiden community detection")
     entitlement_clusters, leiden_stats = _run_leiden_clustering(
-        n_entitlements=len(matrix.columns),
+        n_entitlements=len(ent_ids),  # CHANGE 2026-02-17
         edges=edges,
         edge_weights=edge_weights,
         resolution=leiden_resolution,
         random_seed=leiden_random_seed,
-        entitlement_ids=matrix.columns.tolist(),
+        entitlement_ids=ent_ids,  # CHANGE 2026-02-17
     )
 
     logger.info(
@@ -148,11 +187,16 @@ def cluster_entitlements_leiden(
     logger.info("Step 4: Assigning users to clusters (multi-membership)")
     user_memberships, cluster_user_counts = _assign_users_to_clusters(
         matrix=matrix,
+        ent_ids=ent_ids,  # CHANGE 2026-02-17
+        user_ids=user_ids,  # CHANGE 2026-02-17
         entitlement_clusters=entitlement_clusters,
         min_coverage=min_entitlement_coverage,
         min_absolute_overlap=min_absolute_overlap,
         max_clusters_per_user=max_clusters_per_user,
     )
+
+    # Track assignment coverage before filtering (diagnostic)
+    assigned_users_before_filter = set(user_memberships.keys())
 
     # Step 5: Drop small clusters
     logger.info("Step 5: Filtering small clusters")
@@ -163,6 +207,15 @@ def cluster_entitlements_leiden(
         min_role_size=min_role_size,
     )
 
+    # Diagnostics: users that lost all memberships due to cluster filtering
+    assigned_users_after_filter = set(user_memberships.keys())
+    users_unassigned_by_filter = assigned_users_before_filter - assigned_users_after_filter
+    if users_unassigned_by_filter:
+        logger.info(
+            f"Cluster filtering unassigned {len(users_unassigned_by_filter)} users "
+            f"(due to clusters <{min_role_size} users)"
+        )
+
     # Step 6: Compute metadata
     logger.info("Step 6: Computing cluster metadata")
     cluster_metadata = _compute_cluster_metadata(
@@ -172,7 +225,8 @@ def cluster_entitlements_leiden(
     )
 
     # Find unassigned users
-    all_users = set(matrix.index)
+    # CHANGE 2026-02-17: Use user_ids parameter instead of matrix.index
+    all_users = set(user_ids)
     assigned_users = set(user_memberships.keys())
     unassigned_users = list(all_users - assigned_users)
 
@@ -196,7 +250,9 @@ def cluster_entitlements_leiden(
 # ============================================================================
 
 def cluster_entitlements_incremental(
-        matrix: pd.DataFrame,
+        matrix: csr_matrix,
+        ent_ids: List[str],
+        user_ids: List[str],
         previous_result: Dict[str, Any],
         config: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -205,8 +261,14 @@ def cluster_entitlements_incremental(
 
     Only re-clusters if data change exceeds threshold, otherwise updates existing.
 
+    NOTE:
+        Incremental clustering is not implemented yet. This function currently
+        falls back to full re-clustering.
+
     Args:
-        matrix: Current user × entitlement matrix
+        matrix: Current user × entitlement matrix (csr_matrix)
+        ent_ids: Entitlement IDs (column labels)
+        user_ids: User IDs (row labels)
         previous_result: Previous clustering result
         config: Configuration dict with clustering parameters
 
@@ -240,14 +302,19 @@ def cluster_entitlements_incremental(
     logger.info("Running full re-clustering")
     return cluster_entitlements_leiden(
         matrix=matrix,
+        ent_ids=ent_ids,
+        user_ids=user_ids,
         leiden_min_similarity=config.get("leiden_min_similarity", 0.3),
         leiden_min_shared_users=config.get("leiden_min_shared_users", 3),
         leiden_resolution=config.get("leiden_resolution", 1.0),
         leiden_random_seed=config.get("leiden_random_seed", 42),
         min_entitlement_coverage=config.get("min_entitlement_coverage", 0.5),
+        min_absolute_overlap=config.get("min_absolute_overlap", 2),
         max_clusters_per_user=config.get("max_clusters_per_user", 5),
         min_role_size=config.get("min_role_size", 10),
         use_sparse=config.get("use_sparse_matrices", True),
+        graph_max_neighbors_per_node=config.get("graph_max_neighbors_per_node", 500),
+        graph_max_entitlement_frequency_pct=config.get("graph_max_entitlement_frequency_pct", 0.95),
     )
 
 
@@ -277,9 +344,51 @@ def _validate_clustering_params(**params):
             f"<0.3 assigns users to too many roles, >0.8 leaves most unassigned"
         )
 
+    resolution = params.get("leiden_resolution", 1.0)
+    if not 0.1 <= resolution <= 5.0:
+        raise ValueError(
+            f"leiden_resolution={resolution} must be in [0.1, 5.0]."
+        )
+
+    min_abs = params.get("min_absolute_overlap", 1)
+    if min_abs < 1:
+        raise ValueError(
+            f"min_absolute_overlap={min_abs} must be >=1"
+        )
+
+    max_per_user = params.get("max_clusters_per_user", 1)
+    if max_per_user < 1:
+        raise ValueError(
+            f"max_clusters_per_user={max_per_user} must be >=1"
+        )
+
+    min_role_size = params.get("min_role_size", 1)
+    if min_role_size < 1:
+        raise ValueError(
+            f"min_role_size={min_role_size} must be >=1"
+        )
+
+    # Graph sparsification controls
+    max_neighbors = params.get("graph_max_neighbors_per_node", 0)
+    if max_neighbors is not None and max_neighbors < 1:
+        raise ValueError(
+            f"graph_max_neighbors_per_node={max_neighbors} must be >=1"
+        )
+
+    max_freq = params.get("graph_max_entitlement_frequency_pct", 1.0)
+    if max_freq is not None and not 0.0 < max_freq <= 1.0:
+        raise ValueError(
+            f"graph_max_entitlement_frequency_pct={max_freq} must be in (0, 1]."
+        )
+
 
 def _transpose_to_sparse(matrix: pd.DataFrame) -> csr_matrix:
-    """Transpose matrix to sparse CSR format (entitlements × users)."""
+    """
+    Transpose matrix to sparse CSR format (entitlements × users).
+
+    CHANGE 2026-02-17: DEPRECATED - No longer needed since matrix is already sparse.
+    Kept for backward compatibility but should not be called.
+    """
     # Convert to sparse if not already
     if isinstance(matrix, pd.DataFrame):
         sparse = csr_matrix(matrix.values.astype(np.int8))
@@ -296,6 +405,8 @@ def _build_jaccard_graph_sparse(
         min_similarity: float,
         min_shared_users: int,
         entitlement_ids: List[str],
+        max_neighbors_per_node: Optional[int] = None,
+        max_entitlement_frequency_pct: Optional[float] = None,
 ) -> Tuple[List[Tuple[int, int]], List[float]]:
     """
     Build Jaccard similarity graph from sparse entitlement matrix.
@@ -319,6 +430,21 @@ def _build_jaccard_graph_sparse(
     # Pre-compute row sums (total users per entitlement)
     row_sums = np.asarray(ent_matrix.sum(axis=1)).flatten()
 
+    # Optional: frequency gating to prevent ultra-common entitlements from creating
+    # extremely dense overlap graphs. We only skip these entitlements for EDGE BUILDING;
+    # they can still be handled elsewhere (e.g., birthright detection / prevalence tiers).
+    excluded_nodes = None
+    if max_entitlement_frequency_pct is not None:
+        n_users = ent_matrix.shape[1]
+        max_users = int(max_entitlement_frequency_pct * n_users)
+        excluded_nodes = row_sums > max_users
+        excluded_count = int(np.sum(excluded_nodes))
+        if excluded_count > 0:
+            logger.info(
+                f"Graph frequency gating: excluding {excluded_count}/{n_ents} entitlements "
+                f"with >{max_entitlement_frequency_pct:.0%} user coverage from edge building"
+            )
+
     # Build edges
     edges = []
     weights = []
@@ -326,6 +452,10 @@ def _build_jaccard_graph_sparse(
     for i, j, intersection in zip(overlap_coo.row, overlap_coo.col, overlap_coo.data):
         # Skip diagonal and upper triangle (undirected graph)
         if i >= j:
+            continue
+
+        # Skip entitlements excluded by frequency gating
+        if excluded_nodes is not None and (excluded_nodes[i] or excluded_nodes[j]):
             continue
 
         # Filter by min shared users
@@ -342,6 +472,33 @@ def _build_jaccard_graph_sparse(
         if jaccard >= min_similarity:
             edges.append((int(i), int(j)))
             weights.append(float(jaccard))
+
+    # Optional: cap the number of incident edges per node to keep the graph sparse.
+    # We keep edges that are in the top-k (by weight) for EITHER endpoint.
+    if max_neighbors_per_node is not None:
+        k = int(max_neighbors_per_node)
+        if k > 0 and len(edges) > 0:
+            incident: Dict[int, List[Tuple[float, int]]] = {}
+            for idx, ((a, b), w) in enumerate(zip(edges, weights)):
+                incident.setdefault(a, []).append((w, idx))
+                incident.setdefault(b, []).append((w, idx))
+
+            keep = set()
+            for node, items in incident.items():
+                if len(items) <= k:
+                    keep.update(idx for _, idx in items)
+                    continue
+                # Select top-k by weight (descending)
+                items.sort(key=lambda t: t[0], reverse=True)
+                keep.update(idx for _, idx in items[:k])
+
+            if len(keep) < len(edges):
+                edges = [edges[i] for i in sorted(keep)]
+                weights = [weights[i] for i in sorted(keep)]
+                logger.info(
+                    f"Graph neighbor cap: retained {len(edges)} edges after capping "
+                    f"to top-{k} incident edges per node"
+                )
 
     return edges, weights
 
@@ -406,7 +563,9 @@ def _run_leiden_clustering(
 
 
 def _assign_users_to_clusters(
-        matrix: pd.DataFrame,
+        matrix,  # CHANGE 2026-02-17: Now csr_matrix
+        ent_ids,  # CHANGE 2026-02-17: Entitlement IDs
+        user_ids,  # CHANGE 2026-02-17: User IDs
         entitlement_clusters: Dict[int, List[str]],
         min_coverage: float,
         min_absolute_overlap: int,
@@ -414,6 +573,8 @@ def _assign_users_to_clusters(
 ) -> Tuple[Dict[str, List[Dict]], Dict[int, int]]:
     """
     Assign users to clusters based on coverage threshold.
+
+    CHANGE 2026-02-17: Updated to work with sparse matrix + indices.
 
     Users can belong to multiple clusters (multi-membership).
     Both conditions must be satisfied: coverage >= min_coverage AND
@@ -430,8 +591,9 @@ def _assign_users_to_clusters(
         cluster_user_counts: {cluster_id: user_count}
     """
     cluster_ids = sorted(entitlement_clusters.keys())
-    ent_index = {ent: i for i, ent in enumerate(matrix.columns)}
-    n_ents = len(matrix.columns)
+    # CHANGE 2026-02-17: Use ent_ids parameter instead of matrix.columns
+    ent_index = {ent: i for i, ent in enumerate(ent_ids)}
+    n_ents = len(ent_ids)
     n_clusters = len(cluster_ids)
 
     # Build cluster indicator matrix: (n_clusters x n_ents), binary
@@ -443,48 +605,66 @@ def _assign_users_to_clusters(
             if ent in ent_index:
                 rows.append(c_pos)
                 cols.append(ent_index[ent])
-        cluster_sizes[c_pos] = len([e for e in entitlement_clusters[cid] if e in ent_index])
+        # cluster_sizes is computed below using bincount to avoid per-cluster list allocation
     cluster_matrix = csr_matrix(
         (np.ones(len(rows), dtype=np.int32), (rows, cols)),
         shape=(n_clusters, n_ents),
     )
 
+    # Compute cluster sizes without allocating a list per cluster
+    if len(rows) > 0:
+        cluster_sizes[:] = np.bincount(
+            np.asarray(rows, dtype=np.int32),
+            minlength=n_clusters,
+        ).astype(np.int32)
+
     # Sparse user matrix: (n_users x n_ents)
-    user_matrix = csr_matrix(matrix.values.astype(np.int32))
+    # CHANGE 2026-02-17: Matrix is already sparse, no need for conversion
+    user_matrix = matrix.astype(np.int32)
 
-    # overlap[u, c] = number of cluster c entitlements user u holds
-    # shape: (n_users x n_clusters)
-    overlap = (user_matrix @ cluster_matrix.T).toarray()
+    # overlap_sparse[u, c] = number of cluster c entitlements user u holds
+    # Kept sparse to avoid materializing n_users × n_clusters dense matrix
+    overlap_sparse = (user_matrix @ cluster_matrix.T).tocsr()
 
-    # coverage[u, c] = overlap[u, c] / cluster_size[c]
     # Avoid division by zero for empty clusters (shouldn't occur post-filtering)
     safe_sizes = np.where(cluster_sizes > 0, cluster_sizes, 1)
-    coverage = overlap / safe_sizes[np.newaxis, :]
-
-    # Apply both thresholds
-    member_mask = (coverage >= min_coverage) & (overlap >= min_absolute_overlap)
 
     # Build output dicts
-    user_ids = matrix.index.tolist()
+    # CHANGE 2026-02-17: Use user_ids parameter instead of matrix.index
     user_memberships = {}
     cluster_user_counts = {cid: 0 for cid in cluster_ids}
 
     for u_pos, user_id in enumerate(user_ids):
-        qualifying = np.where(member_mask[u_pos])[0]
-        if len(qualifying) == 0:
+        row_start = overlap_sparse.indptr[u_pos]
+        row_end = overlap_sparse.indptr[u_pos + 1]
+        if row_start == row_end:
+            continue  # user has no overlap with any cluster
+
+        c_positions = overlap_sparse.indices[row_start:row_end]   # cluster column positions
+        overlap_vals = overlap_sparse.data[row_start:row_end].astype(np.float64)
+        coverage_vals = overlap_vals / safe_sizes[c_positions]
+
+        # Apply both thresholds
+        mask = (coverage_vals >= min_coverage) & (overlap_vals >= min_absolute_overlap)
+        qualifying_local = np.where(mask)[0]
+        if len(qualifying_local) == 0:
             continue
 
-        # Sort by coverage descending, cap at max_clusters_per_user
-        qualifying = qualifying[np.argsort(-coverage[u_pos, qualifying])]
-        qualifying = qualifying[:max_clusters_per_user]
+        # Sort by coverage descending; break ties by overlap count descending.
+        # This reduces bias toward tiny clusters that can yield high coverage with small absolute overlap.
+        idxs = qualifying_local
+        order = np.lexsort((-overlap_vals[idxs], -coverage_vals[idxs]))  # primary: coverage, secondary: overlap
+        qualifying_local = idxs[order]
+        qualifying_local = qualifying_local[:max_clusters_per_user]
 
         memberships = []
-        for c_pos in qualifying:
+        for idx in qualifying_local:
+            c_pos = c_positions[idx]
             cid = cluster_ids[c_pos]
             memberships.append({
                 "cluster_id": cid,
-                "coverage": round(float(coverage[u_pos, c_pos]), 4),
-                "count": int(overlap[u_pos, c_pos]),
+                "coverage": round(float(coverage_vals[idx]), 4),
+                "count": int(overlap_vals[idx]),
                 "total": int(cluster_sizes[c_pos]),
             })
             cluster_user_counts[cid] += 1
@@ -542,7 +722,7 @@ def _filter_small_clusters(
 def _compute_cluster_metadata(
         entitlement_clusters: Dict[int, List[str]],
         user_memberships: Dict[str, List[Dict]],
-        matrix: pd.DataFrame,
+        matrix,
 ) -> Dict[int, Dict[str, Any]]:
     """Compute per-cluster statistics."""
     metadata = {}
@@ -572,8 +752,12 @@ def _compute_cluster_metadata(
     return metadata
 
 
-def _empty_clustering_result(matrix: pd.DataFrame) -> Dict[str, Any]:
-    """Return empty result when clustering fails."""
+def _empty_clustering_result(matrix, user_ids, ent_ids) -> Dict[str, Any]:
+    """
+    Return empty result when clustering fails.
+
+    CHANGE 2026-02-17: Updated to work with sparse matrix + indices.
+    """
     return {
         "entitlement_clusters": {},
         "user_cluster_membership": {},
@@ -581,16 +765,16 @@ def _empty_clustering_result(matrix: pd.DataFrame) -> Dict[str, Any]:
         "leiden_stats": {
             "cpm_quality": 0.0,
             "initial_clusters": 0,
-            "graph_nodes": len(matrix.columns),
+            "graph_nodes": len(ent_ids),  # CHANGE 2026-02-17
             "graph_edges": 0,
         },
         "n_clusters": 0,
-        "unassigned_users": matrix.index.tolist(),
+        "unassigned_users": list(user_ids),  # CHANGE 2026-02-17
     }
 
 
 def _compute_data_change_magnitude(
-        current_matrix: pd.DataFrame,
+        current_matrix: csr_matrix,
         previous_result: Dict[str, Any],
 ) -> float:
     """
@@ -605,7 +789,7 @@ def _compute_data_change_magnitude(
 
 
 def _update_clusters_incrementally(
-        matrix: pd.DataFrame,
+        matrix: csr_matrix,
         previous_result: Dict[str, Any],
         config: Dict[str, Any],
 ) -> Dict[str, Any]:
@@ -641,24 +825,32 @@ if __name__ == "__main__":
     users_idx = np.random.choice(n_users, size=n_assignments, replace=True)
     ents_idx = np.random.choice(n_ents, size=n_assignments, replace=True)
 
-    matrix = pd.DataFrame(0, index=user_ids, columns=ent_ids, dtype=np.int8)
-    for u_idx, e_idx in zip(users_idx, ents_idx):
-        matrix.iloc[u_idx, e_idx] = 1
+    # Build sparse CSR matrix directly
+    data = np.ones(len(users_idx), dtype=np.int8)
+    matrix = csr_matrix(
+        (data, (users_idx, ents_idx)),
+        shape=(n_users, n_ents),
+        dtype=np.int8,
+    )
 
     print(f"Synthetic matrix: {matrix.shape[0]} users × {matrix.shape[1]} entitlements")
-    print(f"Sparsity: {1 - matrix.values.mean():.2%}")
-    print(f"Avg entitlements/user: {matrix.sum(axis=1).mean():.1f}")
+    print(f"Sparsity: {1 - (matrix.nnz / (n_users * n_ents)):.2%}")
+    print(f"Avg entitlements/user: {float(matrix.sum(axis=1).mean()):.1f}")
 
     # Run clustering
     if LEIDEN_AVAILABLE:
         result = cluster_entitlements_leiden(
             matrix=matrix,
+            ent_ids=ent_ids,
+            user_ids=user_ids,
             leiden_min_similarity=0.3,
             leiden_min_shared_users=3,
             leiden_resolution=1.0,
             min_entitlement_coverage=0.5,
             max_clusters_per_user=5,
             min_role_size=10,
+            graph_max_neighbors_per_node=500,
+            graph_max_entitlement_frequency_pct=0.95,
         )
 
         print(f"\nClustering results:")

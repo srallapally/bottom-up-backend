@@ -32,8 +32,18 @@ def parse_assignments(filepath: str) -> pd.DataFrame:
     return df
 
 
-def build_user_entitlement_matrix(assignments: pd.DataFrame) -> pd.DataFrame:
-    """Build binary user x entitlement matrix using categorical indexing for scale."""
+def build_user_entitlement_matrix(assignments: pd.DataFrame):
+    """
+    Build binary user x entitlement matrix using categorical indexing for scale.
+    
+    CHANGE 2026-02-17: Now returns sparse matrix + indices to avoid densification.
+    
+    Returns:
+        tuple: (sparse_matrix, user_ids, ent_ids) where:
+            - sparse_matrix: scipy.sparse.csr_matrix (users × entitlements)
+            - user_ids: Index object with user IDs (row labels)
+            - ent_ids: Index object with entitlement IDs (column labels)
+    """
     user_cat = pd.Categorical(assignments["USR_ID"])
     ent_cat = pd.Categorical(assignments["namespaced_id"])
 
@@ -48,14 +58,8 @@ def build_user_entitlement_matrix(assignments: pd.DataFrame) -> pd.DataFrame:
     # Clamp duplicates to 1
     sparse.data[:] = 1
 
-    matrix = pd.DataFrame(
-        sparse.toarray(),
-        index=user_cat.categories,
-        columns=ent_cat.categories,
-        dtype=np.int8,
-    )
-    matrix.index.name = "USR_ID"
-    return matrix
+    # CHANGE 2026-02-17: Return sparse + indices, not dense DataFrame
+    return sparse, user_cat.categories, ent_cat.categories
 
 
 def process_upload(session_path: str) -> dict:
@@ -88,13 +92,24 @@ def process_upload(session_path: str) -> dict:
         catalog = parse_entitlements(entitlements_file)
 
     # Build matrix
-    matrix = build_user_entitlement_matrix(assignments)
+    # CHANGE 2026-02-17: Now returns sparse matrix + indices
+    matrix_sparse, user_ids, ent_ids = build_user_entitlement_matrix(assignments)
 
     # Save processed data
-    # identities.to_csv(os.path.join(processed_dir, "identities.csv"))
     identities.reset_index().to_csv(os.path.join(processed_dir, "identities.csv"), index=False)
     assignments.to_csv(os.path.join(processed_dir, "assignments.csv"), index=False)
-    matrix.to_csv(os.path.join(processed_dir, "matrix.csv"))
+    
+    # CHANGE 2026-02-17: Save sparse matrix in npz format instead of CSV
+    # Also save indices separately for reconstruction
+    import scipy.sparse as sp
+    sp.save_npz(os.path.join(processed_dir, "matrix.npz"), matrix_sparse)
+    pd.Series(user_ids, name="USR_ID").to_csv(
+        os.path.join(processed_dir, "matrix_users.csv"), index=False
+    )
+    pd.Series(ent_ids, name="namespaced_id").to_csv(
+        os.path.join(processed_dir, "matrix_entitlements.csv"), index=False
+    )
+    
     if catalog is not None:
         catalog.to_csv(os.path.join(processed_dir, "catalog.csv"), index=False)
 
@@ -105,8 +120,8 @@ def process_upload(session_path: str) -> dict:
     total_assignments = assignments.drop_duplicates(subset=["USR_ID", "namespaced_id"]).shape[0]
 
     return {
-        "total_users": matrix.shape[0],
-        "total_entitlements": matrix.shape[1],
+        "total_users": matrix_sparse.shape[0],
+        "total_entitlements": matrix_sparse.shape[1],
         "total_assignments": int(total_assignments),
         "apps": apps,
         "entitlements_per_app": entitlements_per_app,

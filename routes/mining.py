@@ -21,7 +21,6 @@ from typing import Dict, Any
 
 from flask import Blueprint, request, jsonify
 
-
 logger = logging.getLogger(__name__)
 
 # Add parent directory to path for imports
@@ -47,6 +46,30 @@ from services.birthright import detect_birthright
 from services.clustering import cluster_entitlements_leiden
 from services.role_builder import build_roles
 
+# CHANGE 2026-02-17: Import for sparse matrix loading
+import scipy.sparse as sp
+import pandas as pd
+
+
+def load_sparse_matrix(session_id: str):
+    """
+    CHANGE 2026-02-17: Load sparse matrix from npz file with indices.
+
+    Returns:
+        tuple: (sparse_matrix, user_ids, ent_ids)
+    """
+    session_path = get_session_path(session_id)
+    matrix_path = os.path.join(session_path, "processed", "matrix.npz")
+    users_path = os.path.join(session_path, "processed", "matrix_users.csv")
+    ents_path = os.path.join(session_path, "processed", "matrix_entitlements.csv")
+
+    matrix_sparse = sp.load_npz(matrix_path)
+    user_ids = pd.read_csv(users_path)["USR_ID"].values
+    ent_ids = pd.read_csv(ents_path)["namespaced_id"].values
+
+    return matrix_sparse, user_ids, ent_ids
+
+
 try:
     from services.confidence_scorer import (
         score_assignments,
@@ -55,10 +78,10 @@ try:
         build_scoring_summary,
         save_cluster_assignments,
     )
+
     CONFIDENCE_SCORER_V2_AVAILABLE = True
 except ImportError:
     CONFIDENCE_SCORER_V2_AVAILABLE = False
-
 
 mining_bp = Blueprint("mining", __name__)
 
@@ -150,7 +173,8 @@ def mine_v2(session_id):
         return jsonify({"error": "Session not found"}), 404
 
     # Check processed data exists
-    matrix_path = os.path.join(session_path, "processed", "matrix.csv")
+    # CHANGE 2026-02-17: Now checking for .npz file instead of .csv
+    matrix_path = os.path.join(session_path, "processed", "matrix.npz")
     if not os.path.isfile(matrix_path):
         return jsonify({"error": "No processed data. Call /process first."}), 400
 
@@ -161,7 +185,8 @@ def mine_v2(session_id):
 
     # Step 1: Load data
     logger.info("Step 1: Loading processed data")
-    matrix = load_dataframe(session_id, "processed/matrix.csv")
+    # CHANGE 2026-02-17: Load sparse matrix + indices instead of dense DataFrame
+    matrix, user_ids, ent_ids = load_sparse_matrix(session_id)
     identities = load_dataframe(session_id, "processed/identities.csv")
 
     catalog = None
@@ -209,8 +234,11 @@ def mine_v2(session_id):
 
     # Step 4: Birthright detection (reuse V1)
     logger.info("Step 4: Detecting birthright entitlements")
+    # CHANGE 2026-02-17: Pass sparse matrix with indices
     birthright_result = detect_birthright(
         matrix=matrix,
+        user_ids=user_ids,
+        ent_ids=ent_ids,
         threshold=config.birthright_threshold,
         explicit_list=birthright_explicit_flat,
         min_assignment_count=config.min_assignment_count,
@@ -225,8 +253,11 @@ def mine_v2(session_id):
     # Step 5: Entitlement clustering (V2 - Leiden)
     logger.info("Step 5: Running Leiden clustering")
     try:
+        # CHANGE 2026-02-17: Pass filtered_ent_ids from birthright result
         cluster_result = cluster_entitlements_leiden(
             matrix=birthright_result["filtered_matrix"],
+            ent_ids=birthright_result["filtered_ent_ids"],
+            user_ids=user_ids,
             leiden_min_similarity=config.leiden_min_similarity,
             leiden_min_shared_users=config.leiden_min_shared_users,
             leiden_resolution=config.leiden_resolution,
@@ -250,13 +281,16 @@ def mine_v2(session_id):
 
     # Step 6: Build roles from clusters (V2)
     logger.info("Step 6: Building roles from clusters")
+    # CHANGE 2026-02-17: Pass user_ids and ent_ids for sparse matrix compatibility
     roles_result = build_roles(
-            matrix=matrix,
-            cluster_result=cluster_result,
-            birthright_result=birthright_result,
-            identities=identities,
-            catalog=catalog,
-            config=config.to_dict(),
+        matrix=matrix,
+        user_ids=user_ids,
+        ent_ids=ent_ids,
+        cluster_result=cluster_result,
+        birthright_result=birthright_result,
+        identities=identities,
+        catalog=catalog,
+        config=config.to_dict(),
     )
 
     draft_roles = roles_result["roles"]
@@ -297,10 +331,13 @@ def mine_v2(session_id):
 
         if CONFIDENCE_SCORER_V2_AVAILABLE:
             try:
+                from services.confidence_scorer import SparseMatrixAccessor
+                matrix_for_scoring = SparseMatrixAccessor(matrix, user_ids, ent_ids)
+
                 # Score all assignments with V2 multi-factor confidence
                 enriched_assignments = score_assignments(
                     assignments_df=assignments_df,
-                    full_matrix=matrix,
+                    full_matrix=matrix_for_scoring,
                     identities=identities,
                     cluster_result=cluster_result,
                     roles=draft_roles,
@@ -321,7 +358,9 @@ def mine_v2(session_id):
                 # TODO: Implement recommendations_v2 properly
                 recommendations = generate_recommendations(
                     enriched_assignments=enriched_assignments,
-                    full_matrix=matrix,
+                    # CHANGE 2026-02-17: Pass SparseMatrixAccessor for sparse-safe lookups
+                    # (avoids accidental densification inside recommendation logic)
+                    full_matrix=matrix_for_scoring,
                     cluster_result=cluster_result,
                     config=config.to_dict(),
                 )
@@ -331,8 +370,6 @@ def mine_v2(session_id):
                     enriched_assignments=enriched_assignments,
                     revocation_threshold=config.revocation_threshold,
                 )
-
-                # results_path = get_results_path(session_path)
 
                 # Save scoring outputs to results_v2/
                 recommendations.to_csv(
