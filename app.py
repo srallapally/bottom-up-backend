@@ -1,7 +1,7 @@
 import logging
 from flask import Flask
 from flask_cors import CORS
-
+from services.interceptors import install_interceptors
 from routes.upload import upload_bp
 from routes.export import export_bp
 from routes.mining import mining_bp
@@ -18,7 +18,7 @@ logging.basicConfig(
 def create_app():
     app = Flask(__name__)
     CORS(app)
-
+    install_interceptors(app)
     # V1 blueprints (existing)
     app.register_blueprint(upload_bp)
     app.register_blueprint(mining_bp)
