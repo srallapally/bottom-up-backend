@@ -12,6 +12,13 @@ logger = logging.getLogger(__name__)
 
 META_FILENAME = "meta.json"
 
+# Upload file naming conventions used by the UI/backend.
+UPLOAD_FILENAMES = {
+    "identities": "identities.csv",
+    "assignments": "assignments.csv",
+    "entitlements": "entitlements.csv",
+}
+
 
 def _write_meta(session_path: str, owner: dict) -> None:
     meta = {
@@ -102,7 +109,23 @@ def list_sessions(owner_sub: str | None = None) -> list[dict]:
 
 
 def get_session_path(session_id: str) -> str:
-    session_path = os.path.join(BASE_DATA_DIR, session_id)
+    """Return the absolute on-disk path for a session.
+
+    Security: validate the session_id and prevent path traversal outside BASE_DATA_DIR.
+    """
+    # Ensure the path component is a UUID (all sessions are created with UUIDs).
+    try:
+        uuid.UUID(session_id)
+    except Exception as e:
+        raise ValueError("Invalid session_id") from e
+
+    base_dir_abs = os.path.abspath(BASE_DATA_DIR)
+    session_path = os.path.abspath(os.path.join(base_dir_abs, session_id))
+
+    # Prevent traversal (e.g., session_id=../../etc)
+    if not (session_path == base_dir_abs or session_path.startswith(base_dir_abs + os.sep)):
+        raise ValueError("Invalid session_id")
+
     logger.info(f"Session path: {session_path}")
     if not os.path.isdir(session_path):
         raise FileNotFoundError(f"Session {session_id} not found")
@@ -143,3 +166,86 @@ def load_dataframe(session_id: str, filename: str) -> pd.DataFrame:
     if "matrix.csv" in filename:
         return pd.read_csv(filepath, index_col=0)
     return pd.read_csv(filepath)
+
+
+def _count_csv_data_rows(filepath: str) -> int:
+    """Return the number of data rows in a CSV (excluding the header row).
+
+    This is intentionally implemented without pandas for performance on large
+    files (e.g., millions of lines). It assumes the file has a single header row.
+    """
+    # Fast path: count newlines in binary chunks.
+    # This counts physical lines; it will not handle embedded newlines inside
+    # quoted CSV fields. For our role-mining CSVs, that is an acceptable constraint.
+    line_count = 0
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)  # 1MB
+            if not chunk:
+                break
+            line_count += chunk.count(b"\n")
+
+    # If file ends without a trailing newline, count the last line.
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            last = f.read(1)
+            if last and last != b"\n":
+                line_count += 1
+    except OSError:
+        # Empty file
+        return 0
+
+    # Subtract header row if present.
+    return max(0, line_count - 1)
+
+
+def get_upload_file_info(session_id: str, file_type: str) -> dict | None:
+    """Compute upload file metadata on demand.
+
+    Returns None if the file is not present.
+
+    Output shape (when present):
+      {
+        "present": True,
+        "filename": "identities.csv",
+        "size_bytes": 1234,
+        "row_count": 5678
+      }
+    """
+    filename = UPLOAD_FILENAMES.get(file_type)
+    if not filename:
+        raise ValueError(f"Unknown file_type: {file_type}")
+
+    session_path = get_session_path(session_id)
+    uploads_dir = os.path.join(session_path, "uploads")
+    filepath = os.path.join(uploads_dir, filename)
+    if not os.path.isfile(filepath):
+        return None
+
+    try:
+        size_bytes = os.path.getsize(filepath)
+    except OSError:
+        size_bytes = None
+
+    row_count = None
+    try:
+        row_count = _count_csv_data_rows(filepath)
+    except Exception as e:
+        logger.warning("Failed to count rows for %s (%s): %s", filepath, file_type, e)
+
+    return {
+        "present": True,
+        "filename": filename,
+        "size_bytes": size_bytes,
+        "row_count": row_count,
+    }
+
+
+def get_uploaded_files_info(session_id: str) -> dict:
+    """Return per-upload metadata for the known upload CSVs."""
+    return {
+        "identities": get_upload_file_info(session_id, "identities"),
+        "assignments": get_upload_file_info(session_id, "assignments"),
+        "entitlements": get_upload_file_info(session_id, "entitlements"),
+    }

@@ -17,6 +17,71 @@ upload_bp = Blueprint("upload", __name__)
 
 VALID_FILE_TYPES = {"identities", "assignments", "entitlements"}
 
+# Guardrail: reject role-mining CSVs that are too large to process safely.
+# Configure via env for GCP deployments.
+# Example: MAX_CSV_ROWS=2000000
+try:
+    MAX_CSV_ROWS = int(os.getenv("MAX_CSV_ROWS", "2000000"))
+except ValueError:
+    MAX_CSV_ROWS = 2000000
+
+
+def _count_csv_data_rows(filepath: str) -> int:
+    """Count CSV data rows (excluding the header row).
+
+    Note: This counts physical lines and assumes no embedded newlines inside
+    quoted CSV fields. For our role-mining CSVs this is acceptable and is
+    significantly faster than pandas for multi-million line files.
+    """
+    line_count = 0
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)  # 1MB
+            if not chunk:
+                break
+            line_count += chunk.count(b"\n")
+
+    # If file ends without a trailing newline, count the last line.
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            last = f.read(1)
+            if last and last != b"\n":
+                line_count += 1
+    except OSError:
+        # Empty file
+        return 0
+
+    # Subtract header row if present.
+    return max(0, line_count - 1)
+
+
+def _upload_file_info(uploads_dir: str, file_type: str) -> dict | None:
+    """Return file metadata for an uploaded CSV, or None if not present."""
+    path = os.path.join(uploads_dir, f"{file_type}.csv")
+    if not os.path.isfile(path):
+        return None
+
+    size_bytes = None
+    try:
+        size_bytes = os.path.getsize(path)
+    except OSError:
+        pass
+
+    row_count = None
+    try:
+        row_count = _count_csv_data_rows(path)
+    except Exception:
+        # Best-effort; keep None if counting fails
+        pass
+
+    return {
+        "present": True,
+        "filename": f"{file_type}.csv",
+        "size_bytes": size_bytes,
+        "row_count": row_count,
+    }
+
 
 def _ensure_owner(session_id: str):
     owner = session_owner_sub(session_id)
@@ -202,6 +267,24 @@ def upload_file(session_id):
     dest = os.path.join(session_path, "uploads", f"{file_type}.csv")
     f.save(dest)
 
+    # Guardrail: enforce a max rows limit before pandas-heavy processing.
+    try:
+        row_count = _count_csv_data_rows(dest)
+        if row_count > MAX_CSV_ROWS:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            return jsonify({
+                "error": "CSV exceeds maximum allowed rows",
+                "max_rows": MAX_CSV_ROWS,
+                "row_count": row_count,
+                "file_type": file_type,
+            }), 400
+    except Exception:
+        # Best-effort: if counting fails, continue and let downstream validation handle it.
+        pass
+
     return jsonify({
         "session_id": session_id,
         "file_type": file_type,
@@ -223,6 +306,25 @@ def process_files(session_id):
         session_path = get_session_path(session_id)
     except FileNotFoundError:
         return jsonify({"error": "Session not found"}), 404
+
+    # Guardrail: re-check uploaded CSV sizes before starting expensive processing.
+    uploads_dir = os.path.join(session_path, "uploads")
+    for ft in ("identities", "assignments", "entitlements"):
+        path = os.path.join(uploads_dir, f"{ft}.csv")
+        if not os.path.isfile(path):
+            continue
+        try:
+            row_count = _count_csv_data_rows(path)
+            if row_count > MAX_CSV_ROWS:
+                return jsonify({
+                    "error": "CSV exceeds maximum allowed rows",
+                    "max_rows": MAX_CSV_ROWS,
+                    "row_count": row_count,
+                    "file_type": ft,
+                }), 400
+        except Exception:
+            # If counting fails, do not block; process_upload may still validate.
+            pass
 
     try:
         stats = process_upload(session_path)
@@ -258,6 +360,13 @@ def session_status(session_id):
         for ft in ("identities", "assignments", "entitlements")
     }
 
+    # Backward compatible: keep boolean uploaded_files, but also include
+    # computed metadata for each uploaded CSV (size + row count).
+    uploaded_files_info = {
+        ft: _upload_file_info(uploads_dir, ft)
+        for ft in ("identities", "assignments", "entitlements")
+    }
+
     stats = None
     stats_path = os.path.join(session_path, "processed", "stats.json")
     if os.path.isfile(stats_path):
@@ -273,6 +382,7 @@ def session_status(session_id):
     return jsonify({
         "session_id": session_id,
         "uploaded_files": uploaded_files,
+        "uploaded_files_info": uploaded_files_info,
         "has_processed": stats is not None,
         "stats": stats,
         "has_config": has_config,

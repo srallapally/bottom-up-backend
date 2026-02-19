@@ -1,10 +1,13 @@
 import os
+import logging
 from flask import request, jsonify, g
 
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
 from models.session import session_owner_sub
+
+logger = logging.getLogger(__name__)
 
 
 PUBLIC_PATHS = (
@@ -54,8 +57,10 @@ def install_interceptors(app):
                 "name": claims.get("name"),
             }
 
-        except Exception as e:
-            return jsonify({"error": "Invalid token", "details": str(e)}), 401
+        except Exception:
+            # Don't leak validation internals to callers.
+            logger.warning("Invalid bearer token", exc_info=True)
+            return jsonify({"error": "Invalid token"}), 401
 
         # auto-ownership enforcement
         session_id = (request.view_args or {}).get("session_id")

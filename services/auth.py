@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import logging
 from functools import wraps
 from flask import request, jsonify, g
 
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+
+logger = logging.getLogger(__name__)
 
 
 def _get_bearer_token() -> str | None:
@@ -53,8 +56,10 @@ def require_auth(fn):
             if not g.user["sub"]:
                 return jsonify({"error": "Invalid token: missing subject"}), 401
 
-        except Exception as e:
-            return jsonify({"error": "Invalid token", "details": str(e)}), 401
+        except Exception:
+            # Don't leak validation internals to callers.
+            logger.warning("Invalid bearer token", exc_info=True)
+            return jsonify({"error": "Invalid token"}), 401
 
         return fn(*args, **kwargs)
 
