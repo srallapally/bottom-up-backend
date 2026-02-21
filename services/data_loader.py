@@ -23,8 +23,20 @@ def parse_entitlements(filepath: str) -> pd.DataFrame:
 
 
 def parse_assignments(filepath: str) -> pd.DataFrame:
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.info(f"Parsing {filepath}")
     df = pd.read_csv(filepath)
     df.columns = df.columns.str.strip()
+    raw_count = len(df)
+    df = df.dropna(subset=["USR_ID", "APP_ID", "ENT_ID"])
+    dropped = raw_count - len(df)
+    if dropped > 0:
+        _logger.warning(
+            f"parse_assignments: dropped {dropped} rows with null USR_ID/APP_ID/ENT_ID (raw={raw_count}, clean={len(df)})")
+    else:
+        _logger.info(f"parse_assignments: {raw_count} rows, none dropped")
+
     df["APP_ID"] = df["APP_ID"].astype(str).str.strip()
     df["ENT_ID"] = df["ENT_ID"].astype(str).str.strip()
     df["USR_ID"] = df["USR_ID"].astype(str).str.strip()
