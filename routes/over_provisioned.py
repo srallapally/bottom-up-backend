@@ -11,6 +11,7 @@ import pandas as pd
 from flask import Blueprint, jsonify, request
 
 from models.session import get_session_path
+from services.auth import require_auth
 
 over_provisioned_bp = Blueprint("over_provisioned", __name__)
 
@@ -18,6 +19,7 @@ over_provisioned_bp = Blueprint("over_provisioned", __name__)
 @over_provisioned_bp.route(
     "/api/sessions/<session_id>/over-provisioned", methods=["GET"]
 )
+@require_auth
 def get_over_provisioned(session_id):
     """
     GET /api/sessions/<id>/over-provisioned

@@ -6,12 +6,16 @@ from flask import Blueprint, request, jsonify, g
 from models.session import (
     create_session,
     get_session_path,
+    sync_file,
     save_json,
     list_sessions,
     session_owner_sub,
+    update_session_fields,
+    sync_session_tree,
 )
 from services.data_loader import process_upload
 from services.auth import require_auth
+from services.cloud_run_jobs import run_process_job
 
 upload_bp = Blueprint("upload", __name__)
 
@@ -144,6 +148,44 @@ def get_sessions():
     raw_sessions = list_sessions(owner_sub=g.user["sub"])
 
     sessions = []
+
+    session_backend = os.getenv("SESSION_BACKEND", "local").strip().lower()
+    if session_backend in {"gcp", "cloud", "firestore", "gcs"}:
+        # In GCP mode, avoid downloading each session from GCS just to compute progress.
+        for s in raw_sessions:
+            session_id = s.get("session_id") or s.get("id")
+            if not session_id:
+                continue
+
+            status = (s.get("status") or "created").lower()
+            progress = {
+                "uploaded": {"identities": False, "assignments": False, "entitlements": False},
+                "processed": status in {"processed", "ready_to_mine", "mining", "mined", "ready"},
+                "mined": status in {"mined", "ready"},
+                "resultsReady": status in {"mined", "ready"},
+            }
+
+            sessions.append({
+                "id": session_id,
+                "name": s.get("name") or session_id,
+                "status": status,
+                "createdAt": s.get("created"),
+                "updatedAt": s.get("updated"),
+                "summary": s.get("summary"),
+                "progress": progress,
+                "links": {
+                    "self": f"/api/sessions/{session_id}",
+                    "status": f"/api/sessions/{session_id}/status",
+                    "config": f"/api/sessions/{session_id}/config",
+                    "results": f"/api/sessions/{session_id}/results",
+                    "process": f"/api/sessions/{session_id}/process",
+                    "mine": f"/api/sessions/{session_id}/mine",
+                    "export": f"/api/sessions/{session_id}/export",
+                },
+            })
+
+        return jsonify({"sessions": sessions}), 200
+
     for s in raw_sessions:
         session_id = s.get("session_id") or s.get("id")  # tolerate either key
         if not session_id:
@@ -267,6 +309,9 @@ def upload_file(session_id):
     dest = os.path.join(session_path, "uploads", f"{file_type}.csv")
     f.save(dest)
 
+    # If running in GCP backend mode, persist the upload to GCS.
+    sync_file(session_id, f"uploads/{file_type}.csv")
+
     # Guardrail: enforce a max rows limit before pandas-heavy processing.
     try:
         row_count = _count_csv_data_rows(dest)
@@ -302,6 +347,26 @@ def process_files(session_id):
     if deny:
         return deny
 
+    execution_backend = os.getenv("EXECUTION_BACKEND", "local").strip().lower()
+    if execution_backend in {"gcp", "cloud", "cloud_run", "cloud_run_jobs", "jobs"}:
+        # Trigger async processing via Cloud Run Jobs. Endpoint contract unchanged.
+        try:
+            update_session_fields(session_id, {"status": "PROCESSING"})
+            op = run_process_job(session_id=session_id, owner_sub=g.user["sub"])
+            return jsonify({
+                "session_id": session_id,
+                "status": "PROCESSING",
+                "operation": op.get("name"),
+            }), 202
+        except FileNotFoundError:
+            return jsonify({"error": "Session not found"}), 404
+        except Exception as e:
+            # Best-effort status update
+            try:
+                update_session_fields(session_id, {"status": "FAILED", "error": str(e)})
+            except Exception:
+                pass
+            return jsonify({"error": str(e)}), 500
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -332,6 +397,9 @@ def process_files(session_id):
         return jsonify({"error": str(e)}), 400
 
     save_json(session_id, "processed/stats.json", stats)
+
+    # Persist any files written by process_upload() when using the GCP storage backend.
+    sync_session_tree(session_id)
 
     return jsonify({
         "session_id": session_id,

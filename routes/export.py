@@ -3,17 +3,35 @@ import io
 import csv
 import json
 import os
+import tempfile
 import zipfile
 
-from flask import Blueprint, Response, jsonify
+from flask import Blueprint, jsonify, g, send_file
 
-from models.session import get_session_path, load_json
+from models.session import get_session_path, load_json, session_owner_sub
+from services.auth import require_auth
+from config.config import get_results_path
 
 export_bp = Blueprint("export", __name__)
 
 
+def _ensure_owner(session_id: str):
+    owner = session_owner_sub(session_id)
+    if not owner:
+        return jsonify({"error": "Session missing owner metadata"}), 403
+    if owner != g.user["sub"]:
+        return jsonify({"error": "Forbidden"}), 403
+    return None
+
+
+
 @export_bp.route("/api/sessions/<session_id>/export", methods=["GET"])
+@require_auth
 def export_results(session_id):
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -24,7 +42,10 @@ def export_results(session_id):
     except FileNotFoundError:
         return jsonify({"error": "No results. Call /mine first."}), 404
 
-    buf = io.BytesIO()
+    results_dir = get_results_path(session_path)
+
+    # Avoid unbounded memory growth for large exports.
+    buf = tempfile.SpooledTemporaryFile(max_size=10 * 1024 * 1024)
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("roles.csv", _build_roles_csv(results["roles"]))
         zf.writestr("role_members.csv", _build_members_csv(results["roles"]))
@@ -32,12 +53,12 @@ def export_results(session_id):
         zf.writestr("residual_access.csv", _build_residuals_csv(results["residuals"]))
 
         # Confidence scoring outputs
-        recs_path = os.path.join(session_path, "results", "recommendations.csv")
+        recs_path = os.path.join(results_dir, "recommendations.csv")
         if os.path.isfile(recs_path):
             with open(recs_path, "r") as f:
                 zf.writestr("recommendations.csv", f.read())
 
-        op_path = os.path.join(session_path, "results", "over_provisioned.csv")
+        op_path = os.path.join(results_dir, "over_provisioned.csv")
         if os.path.isfile(op_path):
             with open(op_path, "r") as f:
                 zf.writestr("over_provisioned.csv", f.read())
@@ -60,16 +81,17 @@ def export_results(session_id):
             zf.writestr("merge_candidates.csv", _build_merge_candidates_csv(candidates))
 
         # Scored assignments (from confidence scorer)
-        scored_path = os.path.join(session_path, "results", "assignments_scored.csv")
+        scored_path = os.path.join(results_dir, "assignments_scored.csv")
         if os.path.isfile(scored_path):
             with open(scored_path, "r") as f:
                 zf.writestr("assignments_scored.csv", f.read())
 
     buf.seek(0)
-    return Response(
-        buf.getvalue(),
+    return send_file(
+        buf,
         mimetype="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=role_mining_{session_id[:8]}.zip"},
+        as_attachment=True,
+        download_name=f"role_mining_{session_id[:8]}.zip",
     )
 
 

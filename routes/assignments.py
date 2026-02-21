@@ -4,10 +4,12 @@ import pandas as pd
 from flask import Blueprint, jsonify, request
 
 from models.session import get_session_path
+from services.auth import require_auth
 
 assignments_bp = Blueprint("assignments", __name__)
 
 @assignments_bp.route("/api/sessions/<session_id>/assignments", methods=["GET"])
+@require_auth
 def assignments(session_id):
     try:
         session_path = get_session_path(session_id)
@@ -31,7 +33,8 @@ def assignments(session_id):
     # Step 3: Parse query parameters
     user_id = request.args.get("user_id")
     confidence_level = request.args.get("confidence_level", "").upper()
-    limit = request.args.get("limit", type=int)
+    # Frontend callers may omit limit; default to a reasonable page size.
+    limit = request.args.get("limit", default=100, type=int)
     include_metadata = request.args.get("include_metadata", "false").lower() == "true"
 
     # Step 4: Validate confidence_level if provided

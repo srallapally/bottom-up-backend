@@ -53,6 +53,10 @@ def create_app():
     # tighten this further (or disable CORS entirely) by setting CORS_ORIGINS to the BFF origin only.
     CORS(app, origins=_parse_cors_origins())
 
+    logging.getLogger(__name__).info(
+        "BOOT env BFF_SHARED_SECRET present=%s",
+        bool(os.getenv("BFF_SHARED_SECRET"))
+    )
     install_interceptors(app)
 
     # V1 blueprints (existing)
@@ -89,7 +93,7 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
     app.run(
-        debug=_env_bool("FLASK_DEBUG", False),
+        debug=_env_bool("FLASK_DEBUG", True),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "5000")),
     )

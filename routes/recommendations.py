@@ -11,6 +11,7 @@ import pandas as pd
 from flask import Blueprint, jsonify, request
 
 from models.session import get_session_path
+from services.auth import require_auth
 
 recommendations_bp = Blueprint("recommendations", __name__)
 
@@ -18,6 +19,7 @@ recommendations_bp = Blueprint("recommendations", __name__)
 @recommendations_bp.route(
     "/api/sessions/<session_id>/recommendations", methods=["GET"]
 )
+@require_auth
 def get_recommendations(session_id):
     """
     GET /api/sessions/<id>/recommendations
@@ -57,6 +59,7 @@ def get_recommendations(session_id):
 @recommendations_bp.route(
     "/api/sessions/<session_id>/recommendations/<user_id>", methods=["GET"]
 )
+@require_auth
 def get_user_recommendations(session_id, user_id):
     """
     GET /api/sessions/<id>/recommendations/<user_id>

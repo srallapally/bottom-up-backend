@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.env.*
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.cache/
+pytest_cache/
+.ipynb_checkpoints/
+
+# local session data/logs
+data/
+logs/
+tmp/
+*.zip

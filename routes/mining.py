@@ -19,9 +19,21 @@ import sys
 import logging
 from typing import Dict, Any
 
-from flask import Blueprint, request, jsonify
-
+from flask import Blueprint, request, jsonify, g
 logger = logging.getLogger(__name__)
+
+from services.auth import require_auth
+from services.cloud_run_jobs import run_mine_job
+
+
+def _ensure_owner(session_id: str):
+    owner = session_owner_sub(session_id)
+    if not owner:
+        return jsonify({"error": "Session missing owner metadata"}), 403
+    if owner != g.user["sub"]:
+        return jsonify({"error": "Forbidden"}), 403
+    return None
+
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,6 +53,9 @@ from models.session import (
     save_json,
     load_json,
     load_dataframe,
+    session_owner_sub,
+    update_session_fields,
+    sync_session_tree,
 )
 from services.birthright import detect_birthright
 from services.clustering import cluster_entitlements_leiden
@@ -91,6 +106,8 @@ mining_bp = Blueprint("mining", __name__)
 # ============================================================================
 
 @mining_bp.route("/api/sessions/<session_id>/config", methods=["GET"])
+
+@require_auth
 def get_config_v2(session_id):
     """
     GET /api/sessions/<id>/config-v2
@@ -98,6 +115,10 @@ def get_config_v2(session_id):
     Returns V2 configuration for this session.
     Falls back to V1 config if V2 doesn't exist, then to defaults.
     """
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -109,6 +130,8 @@ def get_config_v2(session_id):
 
 
 @mining_bp.route("/api/sessions/<session_id>/config", methods=["PUT"])
+
+@require_auth
 def save_config_v2(session_id):
     """
     PUT /api/sessions/<id>/config-v2
@@ -118,6 +141,10 @@ def save_config_v2(session_id):
 
     Request body: Partial or full config dict (merged with defaults)
     """
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -147,6 +174,8 @@ def save_config_v2(session_id):
 # ============================================================================
 
 @mining_bp.route("/api/sessions/<session_id>/mine", methods=["POST"])
+
+@require_auth
 def mine_v2(session_id):
     """
     POST /api/sessions/<id>/mine-v2
@@ -167,6 +196,10 @@ def mine_v2(session_id):
     Request body: Optional config overrides
     Response: Draft roles for stakeholder review
     """
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -177,6 +210,51 @@ def mine_v2(session_id):
     matrix_path = os.path.join(session_path, "processed", "matrix.npz")
     if not os.path.isfile(matrix_path):
         return jsonify({"error": "No processed data. Call /process first."}), 400
+
+    execution_backend = os.getenv("EXECUTION_BACKEND", "local").strip().lower()
+    if execution_backend in {"gcp", "cloud", "cloud_run", "cloud_run_jobs", "jobs"}:
+        # Trigger async mining via Cloud Run Jobs. Endpoint contract unchanged.
+        # IMPORTANT: Persist any request-body config overrides before triggering the job,
+        # so the worker reads the correct config.json.
+        try:
+            request_body = request.get_json(silent=True) or {}
+            if request_body:
+                config_dict = merge_configs(DEFAULT_MINING_CONFIG, request_body)
+                config = MiningConfig.from_dict(config_dict)
+
+                validation_errors = config.validate()
+                if validation_errors:
+                    return jsonify({
+                        "error": "Invalid configuration",
+                        "validation_errors": validation_errors,
+                    }), 400
+
+                identities = load_dataframe(session_id, "processed/identities.csv")
+                data_validation_errors = config.validate_against_data(
+                    identities_columns=list(identities.columns)
+                )
+                if data_validation_errors:
+                    return jsonify({
+                        "error": "Mining configuration error: attribute columns not found in data",
+                        "validation_errors": data_validation_errors,
+                    }), 400
+
+                save_session_config(session_path, config)
+
+            update_session_fields(session_id, {"status": "MINING"})
+            op = run_mine_job(session_id=session_id, owner_sub=g.user["sub"])
+            return jsonify({
+                "session_id": session_id,
+                "status": "MINING",
+                "operation": op.get("name"),
+            }), 202
+        except Exception as e:
+            try:
+                update_session_fields(session_id, {"status": "FAILED", "error": str(e)})
+            except Exception:
+                pass
+            return jsonify({"error": str(e)}), 500
+
 
     # Initialize V2 directories
     initialize_session_directories(session_path)
@@ -418,6 +496,10 @@ def mine_v2(session_id):
     results_path = get_results_path(session_path)
     save_json(session_id, "results/draft_results.json", results)
 
+    update_session_fields(session_id, {"status": "MINED"})
+    sync_session_tree(session_id)
+
+
     # Save cluster assignments for future drift detection
     # (Store user_cluster_membership for daily comparison)
     save_json(
@@ -434,12 +516,18 @@ def mine_v2(session_id):
 # ============================================================================
 
 @mining_bp.route("/api/sessions/<session_id>/draft-roles", methods=["GET"])
+
+@require_auth
 def get_draft_roles(session_id):
     """
     GET /api/sessions/<id>/draft-roles
 
     Returns draft roles for stakeholder review.
     """
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -458,6 +546,8 @@ def get_draft_roles(session_id):
 
 
 @mining_bp.route("/api/sessions/<session_id>/draft-roles/<role_id>/approve", methods=["POST"])
+
+@require_auth
 def approve_draft_role(session_id, role_id):
     """
     POST /api/sessions/<id>/draft-roles/<role_id>/approve
@@ -475,6 +565,10 @@ def approve_draft_role(session_id, role_id):
     TODO: Implement business role versioning and storage
     For now, just acknowledges the approval.
     """
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         session_path = get_session_path(session_id)
     except FileNotFoundError:
@@ -539,12 +633,18 @@ def approve_draft_role(session_id, role_id):
 # ============================================================================
 
 @mining_bp.route("/api/sessions/<session_id>/results", methods=["GET"])
+
+@require_auth
 def get_results_v2(session_id):
     """
     GET /api/sessions/<id>/results-v2
 
     Returns V2 mining results.
     """
+    deny = _ensure_owner(session_id)
+    if deny:
+        return deny
+
     try:
         get_session_path(session_id)
     except FileNotFoundError:
