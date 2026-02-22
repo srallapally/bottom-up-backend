@@ -61,15 +61,15 @@ def install_interceptors(app):
         if bff_headers_present:
             if not bff_secret_required:
                 # If you want BFF mode, you MUST configure BFF_SHARED_SECRET.
-                if auth_debug:
-                    logger.info("AUTH_DEBUG bff_rejected reason=missing_required_secret path=%s", request.path)
+                # FIX 23: log unconditionally — this is a misconfiguration, not a debug detail.
+                logger.warning("bff_rejected reason=missing_required_secret path=%s", request.path)
             elif bff_secret_provided != bff_secret_required:
-                if auth_debug:
-                    logger.info(
-                        "AUTH_DEBUG bff_rejected reason=secret_mismatch path=%s provided_present=%s",
-                        request.path,
-                        bff_secret_provided is not None,
-                    )
+                # FIX 23: log auth failures unconditionally (not gated behind AUTH_DEBUG).
+                logger.warning(
+                    "bff_rejected reason=secret_mismatch path=%s provided_present=%s",
+                    request.path,
+                    bff_secret_provided is not None,
+                )
             else:
                 bff_ok = True
 
@@ -87,6 +87,11 @@ def install_interceptors(app):
 
                 required_domain = os.getenv("GOOGLE_HOSTED_DOMAIN")
                 if required_domain and claims.get("hd") != required_domain:
+                    # FIX 23: log domain rejection unconditionally.
+                    logger.warning(
+                        "auth_rejected reason=wrong_domain required=%s got=%s path=%s",
+                        required_domain, claims.get("hd"), request.path,
+                    )
                     return jsonify({"error": "Forbidden domain", "userMessage": "Forbidden domain"}), 403
 
                 g.user = {
@@ -109,6 +114,8 @@ def install_interceptors(app):
         else:
             # BFF mode (only if explicitly enabled and secret matches)
             if not bff_ok or not bff_user_id:
+                # FIX 23: log unconditionally.
+                logger.warning("auth_rejected reason=missing_bearer_token path=%s", request.path)
                 return jsonify(
                     {"error": "Missing bearer token", "userMessage": "Missing bearer token"}
                 ), 401
@@ -129,7 +136,14 @@ def install_interceptors(app):
         # ---- Ownership enforcement (only when route contains session_id) ----
         session_id = (request.view_args or {}).get("session_id")
         if session_id:
-            owner = session_owner_sub(session_id)
+            # FIX 13: Cache the Firestore owner lookup in g for the request lifetime.
+            # Without this, every subrequest or helper that triggers ownership
+            # re-evaluation would hit Firestore again for the same session.
+            if not hasattr(g, "session_owner_sub_cache"):
+                g.session_owner_sub_cache = {}
+            if session_id not in g.session_owner_sub_cache:
+                g.session_owner_sub_cache[session_id] = session_owner_sub(session_id)
+            owner = g.session_owner_sub_cache[session_id]
             if not owner:
                 return jsonify({"error": "Session missing owner", "userMessage": "Session missing owner"}), 403
             if owner != g.user["sub"]:

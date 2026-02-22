@@ -17,7 +17,7 @@ Algorithm:
 4. Classify entitlements into core/common tiers per role
 5. Birthright promotion scan (core in >N% of roles)
 6. Pairwise role overlap (Jaccard on core sets, flag merge candidates)
-7. Enrich roles (HR summary, catalog, coverage distribution)
+7. Enrich roles (coverage distribution)
 8. Residuals against expanded core entitlement sets
 9. Build birthright role, summary, multi-cluster stats
 """
@@ -41,8 +41,6 @@ def build_roles(
         ent_ids,  # CHANGE 2026-02-17: Entitlement IDs (column labels)
         cluster_result: Dict[str, Any],
         birthright_result: Dict[str, Any],
-        identities: pd.DataFrame,
-        catalog: Optional[pd.DataFrame] = None,
         config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -56,8 +54,6 @@ def build_roles(
         ent_ids: array-like of entitlement IDs (column labels)
         cluster_result: Output from cluster_entitlements_leiden()
         birthright_result: Output from detect_birthright()
-        identities: User HR attributes DataFrame
-        catalog: Optional entitlement catalog (for enrichment)
         config: Config dict with user_attributes and prevalence thresholds
 
     Returns:
@@ -167,14 +163,8 @@ def build_roles(
         logger.info(f"Found {len(merge_candidates)} merge candidates")
 
     # ---- Step 7: Enrich roles ----
-    logger.info("Step 7: Enriching roles with HR summary and catalog")
+    logger.info("Step 7: Computing coverage distribution")
     for role in roles:
-        role["hr_summary"] = _summarize_hr_attributes(
-            role["members"], identities, config
-        )
-        # Enrich all entitlements that appear in core + common
-        all_role_ents = role["core_entitlements"] + role["common_entitlements"]
-        role["entitlements_detail"] = _enrich_entitlements(all_role_ents, catalog)
         role["coverage_distribution"] = _compute_coverage_distribution(
             role["member_coverage"]
         )
@@ -198,7 +188,6 @@ def build_roles(
     logger.info("Step 9: Building birthright role and summary statistics")
     birthright_role = _build_birthright_role(
         birthright_result=birthright_result,
-        catalog=catalog,
     )
 
     multi_cluster_info = _compute_multi_cluster_stats(
@@ -372,7 +361,7 @@ def _classify_entitlement_tiers(
             role["core_entitlements"] = list(seed_set)
             role["common_entitlements"] = []
             role["entitlement_prevalence"] = {}
-            role["low_prevalence_seeds"] = []
+            del role["seed_entitlements"]
             continue
 
         row_idx = role_id_to_row[role_id]
@@ -385,7 +374,6 @@ def _classify_entitlement_tiers(
 
         core = set(seed_set)
         common = []
-        low_prevalence_seeds = []
         ent_prevalence_dict = {}
 
         for col_idx, prev in zip(col_indices, prev_values):
@@ -394,8 +382,6 @@ def _classify_entitlement_tiers(
             ent_id = ent_ids[col_idx]
             if ent_id in seed_set:
                 ent_prevalence_dict[ent_id] = round(float(prev), 4)
-                if prev < prevalence_threshold:
-                    low_prevalence_seeds.append(ent_id)
             elif prev >= prevalence_threshold:
                 core.add(ent_id)
                 ent_prevalence_dict[ent_id] = round(float(prev), 4)
@@ -406,16 +392,14 @@ def _classify_entitlement_tiers(
         role["core_entitlements"] = sorted(core)
         role["common_entitlements"] = sorted(common)
         role["entitlement_prevalence"] = ent_prevalence_dict
-        role["low_prevalence_seeds"] = sorted(low_prevalence_seeds)
+        del role["seed_entitlements"]
 
     total_core = sum(len(r["core_entitlements"]) for r in roles)
     total_common = sum(len(r["common_entitlements"]) for r in roles)
-    total_seeds = sum(len(r["seed_entitlements"]) for r in roles)
-    promoted = total_core - total_seeds
 
     logger.info(
-        f"Tier classification: {total_seeds} seed entitlements, "
-        f"{promoted} promoted to core, {total_common} common"
+        f"Tier classification: {len(roles)} seed roles, "
+        f"{total_core} core entitlements, {total_common} common"
     )
 
 
@@ -516,91 +500,6 @@ def _compute_role_overlap(
 # HR ATTRIBUTE SUMMARIZATION
 # ============================================================================
 
-def _summarize_hr_attributes(
-        members: List[str],
-        identities: pd.DataFrame,
-        config: Dict[str, Any],
-) -> Dict[str, List[Dict]]:
-    """
-    Summarize top attribute values for role members.
-
-    Reads attribute columns from config["user_attributes"] list.
-    Returns top 3 values per attribute with counts and percentages.
-    """
-    member_data = identities[identities['USR_ID'].isin(members)]
-    if member_data.empty:
-        return {}
-
-    user_attributes = config.get("user_attributes", [])
-    attr_columns = [attr["column"] for attr in user_attributes if "column" in attr]
-
-    summary = {}
-
-    for col in attr_columns:
-        if col not in member_data.columns:
-            continue
-
-        values = member_data[col].dropna()
-        values = values[values != ""]
-
-        if values.empty:
-            continue
-
-        counts = values.value_counts().head(3)
-        summary[col] = [
-            {
-                "value": str(v),
-                "count": int(c),
-                "pct": round(c / len(member_data), 4),
-            }
-            for v, c in counts.items()
-        ]
-
-    return summary
-
-
-# ============================================================================
-# ENTITLEMENT ENRICHMENT
-# ============================================================================
-
-def _enrich_entitlements(
-        entitlement_ids: List[str],
-        catalog: Optional[pd.DataFrame],
-) -> List[Dict[str, str]]:
-    """Enrich entitlement IDs with catalog metadata."""
-    if catalog is not None and not catalog.empty:
-        catalog_lookup = {}
-        for idx, row in catalog.iterrows():
-            try:
-                catalog_lookup[row["namespaced_id"]] = {
-                    "app_id": str(row["APP_ID"]),
-                    "ent_name": str(row.get("ENT_NAME", row["ENT_ID"])),
-                }
-            except KeyError as e:
-                logger.warning(f"Catalog row {idx} missing key: {e}")
-                continue
-
-        enriched = []
-        for ent_id in entitlement_ids:
-            detail = catalog_lookup.get(ent_id, {})
-            enriched.append({
-                "entitlement_id": ent_id,
-                "app_id": detail.get("app_id", ent_id.split(":")[0]),
-                "ent_name": detail.get("ent_name", ent_id.split(":")[-1]),
-            })
-        return enriched
-    else:
-        enriched = []
-        for ent_id in entitlement_ids:
-            parts = ent_id.split(":", 1)
-            enriched.append({
-                "entitlement_id": ent_id,
-                "app_id": parts[0] if len(parts) == 2 else "",
-                "ent_name": parts[1] if len(parts) == 2 else ent_id,
-            })
-        return enriched
-
-
 # ============================================================================
 # COVERAGE STATISTICS
 # ============================================================================
@@ -638,13 +537,10 @@ def _compute_coverage_distribution(member_coverage: Dict[str, Dict]) -> Dict[str
 
 def _build_birthright_role(
         birthright_result: Dict[str, Any],
-        catalog: Optional[pd.DataFrame],
 ) -> Dict[str, Any]:
     """Build birthright role from detection results."""
     birthright_ents = birthright_result["birthright_entitlements"]
     birthright_stats = birthright_result["birthright_stats"]
-
-    entitlements_detail = _enrich_entitlements(birthright_ents, catalog)
 
     return {
         "role_id": "ROLE_BIRTHRIGHT",
@@ -652,7 +548,6 @@ def _build_birthright_role(
         "entitlements": birthright_ents,
         "entitlement_count": len(birthright_ents),
         "stats": birthright_stats,
-        "entitlements_detail": entitlements_detail,
     }
 
 
@@ -809,7 +704,6 @@ def _build_summary(
 
     total_core = sum(len(r.get("core_entitlements", [])) for r in roles)
     total_common = sum(len(r.get("common_entitlements", [])) for r in roles)
-    total_seeds = sum(len(r.get("seed_entitlements", [])) for r in roles)
 
     return {
         "total_roles": len(roles),
@@ -826,8 +720,6 @@ def _build_summary(
         "birthright_entitlements": len(birthright_result["birthright_entitlements"]),
         "noise_entitlements": len(birthright_result.get("noise_entitlements", [])),
         "residual_assignments": len(residuals),
-        "total_seed_entitlements": total_seeds,
         "total_core_entitlements": total_core,
         "total_common_entitlements": total_common,
-        "promoted_to_core": total_core - total_seeds,
     }

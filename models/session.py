@@ -124,6 +124,14 @@ def sync_file(session_id: str, rel_path: str) -> None:
 
     prefix = _gcp_session_prefix(session_id)
     local_dir = _gcp_local_cache_dir(session_id)
+    # FIX 21: log each GCS file upload with size for observability.
+    local_path = os.path.join(local_dir, rel_path)
+    size_bytes = 0
+    try:
+        size_bytes = os.path.getsize(local_path)
+    except OSError:
+        pass
+    logger.info("gcs_sync_file session=%s path=%s bytes=%d", session_id, rel_path, size_bytes)
     _gcp_upload_file(prefix, local_dir, rel_path)
 
 
@@ -138,11 +146,24 @@ def sync_session_tree(session_id: str) -> None:
     prefix = _gcp_session_prefix(session_id)
     local_dir = _gcp_local_cache_dir(session_id)
 
+    # FIX 21: track file count, total bytes, elapsed for GCS sync observability.
+    _t = time.time()
+    _file_count = 0
+    _total_bytes = 0
     for root, _, files in os.walk(local_dir):
         for fname in files:
             local_path = os.path.join(root, fname)
             rel = os.path.relpath(local_path, local_dir).replace(os.sep, "/")
+            try:
+                _total_bytes += os.path.getsize(local_path)
+            except OSError:
+                pass
             _gcp_upload_file(prefix, local_dir, rel)
+            _file_count += 1
+    logger.info(
+        "gcs_sync_tree_complete session=%s files=%d bytes=%d elapsed_ms=%.0f",
+        session_id, _file_count, _total_bytes, (time.time() - _t) * 1000,
+    )
 
 
 def _iso_now() -> str:
@@ -313,7 +334,19 @@ def get_session_path(session_id: str) -> str:
 
     if _REFRESH_CACHE or not os.path.isdir(local_dir):
         os.makedirs(local_dir, exist_ok=True)
-        _gcp_download_prefix(prefix, local_dir)
+        # FIX 15: Skip download when the session has no meaningful artifacts yet.
+        # A freshly created session contains only meta.json in GCS; downloading
+        # it wastes a GCS list + download call and overwrites the copy that
+        # create_session() already wrote locally.
+        # Count non-metadata blobs; only download if any exist.
+        _st, _ = _gcp_clients()
+        _bucket = _st.bucket(_GCS_BUCKET)
+        _has_artifacts = any(
+            b.name != prefix + META_FILENAME
+            for b in _st.list_blobs(_bucket, prefix=prefix, max_results=2)
+        )
+        if _has_artifacts:
+            _gcp_download_prefix(prefix, local_dir)
 
     # Ensure expected subdirs exist even if prefix is partially populated.
     os.makedirs(os.path.join(local_dir, "uploads"), exist_ok=True)
@@ -354,13 +387,26 @@ def update_session_fields(session_id: str, fields: dict) -> None:
     Local: updates meta.json.
     GCP: patches Firestore, and also updates meta.json in the local cache + GCS.
     """
+    # FIX 22: log status transitions at the persistence layer so all callers
+    # (Flask routes, worker, tests) produce a consistent audit trail without
+    # each needing to implement transition logging themselves.
+    new_status = fields.get("status")
+    if new_status:
+        logger.info("session_status_set session=%s status=%s", session_id, new_status)
+
     if not _use_gcp_backend():
         session_path = get_session_path(session_id)
         meta_path = os.path.join(session_path, META_FILENAME)
         meta = _read_json(meta_path)
+        old_status = meta.get("status")
         meta.update(fields)
         meta["updated"] = int(time.time())
         _write_json(meta_path, meta)
+        if new_status and old_status != new_status:
+            logger.info(
+                "session_status_transition session=%s %s -> %s",
+                session_id, old_status or "?", new_status,
+            )
         return
 
     _require_gcp_config()

@@ -7,7 +7,6 @@ from models.session import (
     create_session,
     get_session_path,
     sync_file,
-    save_json,
     list_sessions,
     session_owner_sub,
     update_session_fields,
@@ -396,9 +395,16 @@ def process_files(session_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    save_json(session_id, "processed/stats.json", stats)
+    # FIX 14: Write stats.json directly rather than via save_json().
+    # save_json() calls sync_file() internally, which would upload stats.json to GCS.
+    # sync_session_tree() below then uploads it again as part of the full tree sync.
+    # Writing directly avoids the redundant upload.
+    import json as _json
+    _stats_path = os.path.join(session_path, "processed", "stats.json")
+    with open(_stats_path, "w") as _f:
+        _json.dump(stats, _f, indent=2)
 
-    # Persist any files written by process_upload() when using the GCP storage backend.
+    # Persist all files written by process_upload() (matrix.npz, CSVs, stats.json).
     sync_session_tree(session_id)
 
     return jsonify({

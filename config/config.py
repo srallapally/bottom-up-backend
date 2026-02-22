@@ -29,9 +29,9 @@ VALIDATION_RULES = {
         "error": "Must be >= 2 for meaningful co-occurrence",
     },
     "leiden_resolution": {
-        "min": 0.3,
+        "min": 0.05,
         "max": 3.0,
-        "warning_low": "Resolution < 0.5 may merge distinct roles",
+        "warning_low": "Resolution < 0.05 may merge all entitlements into one cluster",
         "warning_high": "Resolution > 2.0 may over-segment",
     },
     "min_entitlement_coverage": {
@@ -119,7 +119,7 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
     "leiden_min_shared_users": 3,  # Minimum users sharing entitlements for edge
 
     # Leiden algorithm parameters
-    "leiden_resolution": 0.8,  # Controls granularity (0.5-2.0)
+    "leiden_resolution": 0.1,  # Controls granularity (CPM; 0.05-0.5 typical)
                               # Lower = fewer, larger clusters
                               # Higher = more, smaller clusters
     "leiden_random_seed": 42,  # For reproducibility
@@ -300,7 +300,7 @@ class MiningConfig:
     entitlement_clustering_method: str = "leiden"
     leiden_min_similarity: float = 0.3
     leiden_min_shared_users: int = 3
-    leiden_resolution: float = 1.0
+    leiden_resolution: float = 0.1
     leiden_random_seed: int = 42
     min_entitlement_coverage: float = 0.5
     min_absolute_overlap: int = 2
@@ -431,16 +431,14 @@ class MiningConfig:
         if self.min_entitlement_coverage > rule["max"]:
             errors.append(f"min_entitlement_coverage > {rule['max']}: {rule['error_high']}")
 
-        # CHANGED: replaced attribute_weights validation with user_attributes
+        # FIX 3: user_attributes count check moved to validate_for_confidence_scoring().
+        # Only structural correctness is enforced here so POST /mine is never blocked
+        # by an empty user_attributes list.
         rule = VALIDATION_RULES["user_attributes"]
         if not isinstance(self.user_attributes, list):
             errors.append("user_attributes must be a list")
-        elif len(self.user_attributes) < rule["min_count"] or len(self.user_attributes) > rule["max_count"]:
-            errors.append(
-                f"user_attributes has {len(self.user_attributes)} entries: {rule['error_count']}"
-            )
-        else:
-            # Validate each entry has a column field
+        elif len(self.user_attributes) > 0:
+            # Validate structure only when entries are present.
             columns_seen = set()
             has_any_weight = any("weight" in attr for attr in self.user_attributes)
             has_all_weights = all("weight" in attr for attr in self.user_attributes)
@@ -462,7 +460,7 @@ class MiningConfig:
             # Weight validation: either all have weights or none do
             if has_any_weight and not has_all_weights:
                 errors.append("user_attributes: if any entry has a weight, all must have a weight")
-            elif has_all_weights and len(self.user_attributes) >= rule["min_count"]:
+            elif has_all_weights:
                 for i, attr in enumerate(self.user_attributes):
                     w = attr.get("weight", 0)
                     if not isinstance(w, (int, float)) or w <= 0 or w > 1.0:
@@ -526,6 +524,24 @@ class MiningConfig:
         if self.drift_auto_approve_threshold > rule["max"]:
             errors.append(f"drift_auto_approve_threshold > {rule['max']}: {rule['error_high']}")
 
+        return errors
+
+    def validate_for_confidence_scoring(self) -> List[str]:
+        """
+        FIX 3: Additional validation required when user_attributes are used for
+        confidence scoring. Called separately from validate() so mining is not
+        blocked by an empty user_attributes list.
+
+        Call this in mine_v2 before the confidence scoring step, not before mining.
+        """
+        errors = []
+        rule = VALIDATION_RULES["user_attributes"]
+        if not isinstance(self.user_attributes, list):
+            errors.append("user_attributes must be a list")
+        elif len(self.user_attributes) < rule["min_count"] or len(self.user_attributes) > rule["max_count"]:
+            errors.append(
+                f"user_attributes has {len(self.user_attributes)} entries: {rule['error_count']}"
+            )
         return errors
 
     def validate_against_data(self, identities_columns: List[str]) -> List[str]:
@@ -611,10 +627,16 @@ def merge_configs(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, 
     """
     Merge override config into base config.
 
-    Useful for user-specific overrides on top of defaults.
+    FIX 5: One-level deep merge for dict-typed values so that partial overrides
+    of nested keys (e.g. birthright_explicit) don't silently replace the entire
+    base dict. List-typed values are replaced wholesale (standard behaviour).
     """
     merged = base.copy()
-    merged.update(overrides)
+    for key, value in overrides.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = {**merged[key], **value}
+        else:
+            merged[key] = value
     return merged
 
 

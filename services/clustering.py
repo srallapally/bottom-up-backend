@@ -23,6 +23,7 @@ Algorithm:
 
 import numpy as np
 import pandas as pd
+import time
 from scipy.sparse import csr_matrix, coo_matrix
 from typing import Dict, List, Tuple, Optional, Any
 import logging
@@ -117,6 +118,9 @@ def cluster_entitlements_leiden(
         graph_max_entitlement_frequency_pct=graph_max_entitlement_frequency_pct,
     )
 
+    # FIX 19: timing for diagnostics
+    _t_start = time.monotonic()
+
     # CHANGE 2026-02-17: Calculate sparsity from sparse matrix
     logger.info(
         f"Starting Leiden clustering: {matrix.shape[0]} users, "
@@ -129,6 +133,7 @@ def cluster_entitlements_leiden(
     ent_matrix = matrix.T if use_sparse else matrix.T
 
     # Step 2: Build Jaccard similarity graph
+    _t = time.monotonic()
     logger.info("Step 2: Building Jaccard similarity graph")
     edges, edge_weights = _build_jaccard_graph_sparse(
         ent_matrix=ent_matrix,
@@ -138,6 +143,7 @@ def cluster_entitlements_leiden(
         max_neighbors_per_node=graph_max_neighbors_per_node,
         max_entitlement_frequency_pct=graph_max_entitlement_frequency_pct,
     )
+    logger.info(f"Step 2 done: edges={len(edges)} elapsed_ms={int((time.monotonic() - _t)*1000)}")
 
 
     # Diagnostics: summarize graph degree distribution (helps tune min_similarity/min_shared and sparsification knobs)
@@ -168,6 +174,7 @@ def cluster_entitlements_leiden(
     logger.info(f"Graph: {len(ent_ids)} nodes, {len(edges)} edges")  # CHANGE 2026-02-17
 
     # Step 3: Run Leiden clustering
+    _t = time.monotonic()
     logger.info("Step 3: Running Leiden community detection")
     entitlement_clusters, leiden_stats = _run_leiden_clustering(
         n_entitlements=len(ent_ids),  # CHANGE 2026-02-17
@@ -179,11 +186,12 @@ def cluster_entitlements_leiden(
     )
 
     logger.info(
-        f"Leiden found {len(entitlement_clusters)} clusters "
-        f"(cpm_quality={leiden_stats['cpm_quality']:.3f})"
+        f"Step 3 done: clusters={len(entitlement_clusters)} cpm_quality={leiden_stats['cpm_quality']:.3f} "
+        f"elapsed_ms={int((time.monotonic() - _t)*1000)}"
     )
 
     # Step 4: Assign users to clusters (multi-membership)
+    _t = time.monotonic()
     logger.info("Step 4: Assigning users to clusters (multi-membership)")
     user_memberships, cluster_user_counts = _assign_users_to_clusters(
         matrix=matrix,
@@ -194,11 +202,13 @@ def cluster_entitlements_leiden(
         min_absolute_overlap=min_absolute_overlap,
         max_clusters_per_user=max_clusters_per_user,
     )
+    logger.info(f"Step 4 done: assigned_users={len(user_memberships)} elapsed_ms={int((time.monotonic() - _t)*1000)}")
 
     # Track assignment coverage before filtering (diagnostic)
     assigned_users_before_filter = set(user_memberships.keys())
 
     # Step 5: Drop small clusters
+    _t = time.monotonic()
     logger.info("Step 5: Filtering small clusters")
     entitlement_clusters, user_memberships = _filter_small_clusters(
         entitlement_clusters=entitlement_clusters,
@@ -206,6 +216,7 @@ def cluster_entitlements_leiden(
         cluster_user_counts=cluster_user_counts,
         min_role_size=min_role_size,
     )
+    logger.info(f"Step 5 done: clusters_kept={len(entitlement_clusters)} elapsed_ms={int((time.monotonic() - _t)*1000)}")
 
     # Diagnostics: users that lost all memberships due to cluster filtering
     assigned_users_after_filter = set(user_memberships.keys())
@@ -217,12 +228,14 @@ def cluster_entitlements_leiden(
         )
 
     # Step 6: Compute metadata
+    _t = time.monotonic()
     logger.info("Step 6: Computing cluster metadata")
     cluster_metadata = _compute_cluster_metadata(
         entitlement_clusters=entitlement_clusters,
         user_memberships=user_memberships,
         matrix=matrix,
     )
+    logger.info(f"Step 6 done: elapsed_ms={int((time.monotonic() - _t)*1000)}")
 
     # Find unassigned users
     # CHANGE 2026-02-17: Use user_ids parameter instead of matrix.index
@@ -232,7 +245,8 @@ def cluster_entitlements_leiden(
 
     logger.info(
         f"Clustering complete: {len(entitlement_clusters)} final clusters, "
-        f"{len(assigned_users)}/{len(all_users)} users assigned"
+        f"{len(assigned_users)}/{len(all_users)} users assigned "
+        f"total_elapsed_ms={int((time.monotonic() - _t_start)*1000)}"
     )
 
     return {
@@ -345,9 +359,9 @@ def _validate_clustering_params(**params):
         )
 
     resolution = params.get("leiden_resolution", 1.0)
-    if not 0.1 <= resolution <= 5.0:
+    if not 0.05 <= resolution <= 5.0:
         raise ValueError(
-            f"leiden_resolution={resolution} must be in [0.1, 5.0]."
+            f"leiden_resolution={resolution} must be in [0.05, 5.0]."
         )
 
     min_abs = params.get("min_absolute_overlap", 1)

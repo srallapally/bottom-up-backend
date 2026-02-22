@@ -1,6 +1,7 @@
 import logging
 import os
-from flask import Flask
+import time
+from flask import Flask, g, request
 from flask_cors import CORS
 from werkzeug.exceptions import RequestEntityTooLarge
 from services.interceptors import install_interceptors
@@ -71,6 +72,23 @@ def create_app():
 
     if _env_bool("FLASK_DEBUG", False):
         print(f"Registered routes: {[rule.rule for rule in app.url_map.iter_rules()]}")
+
+    @app.before_request
+    def _record_request_start():
+        g.request_start = time.monotonic()
+
+    @app.after_request
+    def _log_request(response):
+        # FIX 16: structured entry/exit log for every endpoint.
+        elapsed_ms = (time.monotonic() - g.get("request_start", time.monotonic())) * 1000
+        logging.getLogger(__name__).info(
+            "request method=%s path=%s status=%d elapsed_ms=%.0f",
+            request.method,
+            request.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
 
     @app.errorhandler(RequestEntityTooLarge)
     def handle_request_entity_too_large(e):

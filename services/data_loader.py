@@ -1,8 +1,12 @@
+# services/data_loader.py
+import logging
 import os
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from scipy.sparse import csr_matrix
+
+_logger = logging.getLogger(__name__)
 
 
 def parse_identities(filepath: str) -> pd.DataFrame:
@@ -23,33 +27,69 @@ def parse_entitlements(filepath: str) -> pd.DataFrame:
 
 
 def parse_assignments(filepath: str) -> pd.DataFrame:
-    import logging
-    _logger = logging.getLogger(__name__)
-    _logger.info(f"Parsing {filepath}")
+    """
+    Parse assignments CSV.
+
+    Cleaning steps (Fix 1, Fix 2):
+      1. Strip whitespace from ID columns before any filtering so
+         whitespace-only values ("  ") don't survive the null check.
+      2. Replace empty strings with NA after stripping, then drop nulls.
+      3. Deduplicate on (USR_ID, namespaced_id) so the saved CSV is
+         clean and the confidence scorer doesn't double-count grants.
+    """
+    _logger.info("parse_assignments: reading %s", filepath)
     df = pd.read_csv(filepath)
     df.columns = df.columns.str.strip()
     raw_count = len(df)
-    df = df.dropna(subset=["USR_ID", "APP_ID", "ENT_ID"])
-    dropped = raw_count - len(df)
-    if dropped > 0:
-        _logger.warning(
-            f"parse_assignments: dropped {dropped} rows with null USR_ID/APP_ID/ENT_ID (raw={raw_count}, clean={len(df)})")
-    else:
-        _logger.info(f"parse_assignments: {raw_count} rows, none dropped")
 
-    df["APP_ID"] = df["APP_ID"].astype(str).str.strip()
-    df["ENT_ID"] = df["ENT_ID"].astype(str).str.strip()
-    df["USR_ID"] = df["USR_ID"].astype(str).str.strip()
+    # FIX 1: Strip before drop so whitespace-only IDs are caught.
+    for col in ("USR_ID", "APP_ID", "ENT_ID"):
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip().replace("", pd.NA)
+
+    df = df.dropna(subset=["USR_ID", "APP_ID", "ENT_ID"])
+    after_drop = len(df)
+    dropped_null = raw_count - after_drop
+    if dropped_null > 0:
+        _logger.warning(
+            "parse_assignments: dropped %d junk rows (null/empty IDs) "
+            "raw=%d clean=%d",
+            dropped_null, raw_count, after_drop,
+        )
+    else:
+        _logger.info("parse_assignments: %d rows, no junk rows dropped", raw_count)
+
     df["namespaced_id"] = df["APP_ID"] + ":" + df["ENT_ID"]
+
+    # FIX 2: Deduplicate before saving so downstream consumers (confidence
+    # scorer) see one row per user-entitlement grant.
+    before_dedup = len(df)
+    df = df.drop_duplicates(subset=["USR_ID", "namespaced_id"])
+    dropped_dupes = before_dedup - len(df)
+    if dropped_dupes > 0:
+        _logger.warning(
+            "parse_assignments: dropped %d duplicate (USR_ID, namespaced_id) rows "
+            "before_dedup=%d after_dedup=%d",
+            dropped_dupes, before_dedup, len(df),
+        )
+    else:
+        _logger.info("parse_assignments: no duplicate grants found")
+
+    _logger.info(
+        "parse_assignments: final=%d rows, %d unique users, %d unique entitlements",
+        len(df),
+        df["USR_ID"].nunique(),
+        df["namespaced_id"].nunique(),
+    )
     return df
 
 
 def build_user_entitlement_matrix(assignments: pd.DataFrame):
     """
     Build binary user x entitlement matrix using categorical indexing for scale.
-    
+
     CHANGE 2026-02-17: Now returns sparse matrix + indices to avoid densification.
-    
+
     Returns:
         tuple: (sparse_matrix, user_ids, ent_ids) where:
             - sparse_matrix: scipy.sparse.csr_matrix (users × entitlements)
@@ -67,7 +107,8 @@ def build_user_entitlement_matrix(assignments: pd.DataFrame):
         (data, (row_idx, col_idx)),
         shape=(len(user_cat.categories), len(ent_cat.categories)),
     )
-    # Clamp duplicates to 1
+    # Clamp any residual duplicates to 1 (assignments is already deduped,
+    # but csr_matrix sums repeated (row, col) pairs during construction).
     sparse.data[:] = 1
 
     # CHANGE 2026-02-17: Return sparse + indices, not dense DataFrame
@@ -109,8 +150,9 @@ def process_upload(session_path: str) -> dict:
 
     # Save processed data
     identities.reset_index().to_csv(os.path.join(processed_dir, "identities.csv"), index=False)
+    # FIX 2: assignments is already deduplicated by parse_assignments; save as-is.
     assignments.to_csv(os.path.join(processed_dir, "assignments.csv"), index=False)
-    
+
     # CHANGE 2026-02-17: Save sparse matrix in npz format instead of CSV
     # Also save indices separately for reconstruction
     import scipy.sparse as sp
@@ -121,20 +163,27 @@ def process_upload(session_path: str) -> dict:
     pd.Series(ent_ids, name="namespaced_id").to_csv(
         os.path.join(processed_dir, "matrix_entitlements.csv"), index=False
     )
-    
+
     if catalog is not None:
         catalog.to_csv(os.path.join(processed_dir, "catalog.csv"), index=False)
 
-    # Stats
+    # Stats — assignments is already deduplicated so len() is correct directly.
     apps = sorted(assignments["APP_ID"].unique().tolist())
     entitlements_per_app = assignments.groupby("APP_ID")["namespaced_id"].nunique().to_dict()
-    # Unique user-entitlement grants (avoid counting duplicate rows)
-    total_assignments = assignments.drop_duplicates(subset=["USR_ID", "namespaced_id"]).shape[0]
+    total_assignments = len(assignments)
+
+    _logger.info(
+        "process_upload: users=%d entitlements=%d assignments=%d apps=%d",
+        matrix_sparse.shape[0],
+        matrix_sparse.shape[1],
+        total_assignments,
+        len(apps),
+    )
 
     return {
         "total_users": matrix_sparse.shape[0],
         "total_entitlements": matrix_sparse.shape[1],
-        "total_assignments": int(total_assignments),
+        "total_assignments": total_assignments,
         "apps": apps,
         "entitlements_per_app": entitlements_per_app,
     }

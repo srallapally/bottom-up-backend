@@ -34,6 +34,7 @@ import json
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Any, Optional, Tuple
+import time
 import logging
 from collections import defaultdict
 
@@ -220,6 +221,7 @@ def score_assignments(
     Returns:
         Enriched assignments DataFrame with confidence columns
     """
+    _t_start = time.monotonic()
     logger.info(f"Scoring {len(assignments_df)} assignments with multi-factor confidence")
 
     # Step 1: Pre-compute attribute prevalence matrices
@@ -310,10 +312,12 @@ def score_assignments(
                 )
 
     logger.info(
-        f"Confidence scoring complete: "
-        f"{(enriched_df['confidence_level'] == 'HIGH').sum()} HIGH, "
-        f"{(enriched_df['confidence_level'] == 'MEDIUM').sum()} MEDIUM, "
-        f"{(enriched_df['confidence_level'] == 'LOW').sum()} LOW"
+        "Confidence scoring complete: %d HIGH, %d MEDIUM, %d LOW, total=%d elapsed_ms=%.0f",
+        (enriched_df['confidence_level'] == 'HIGH').sum(),
+        (enriched_df['confidence_level'] == 'MEDIUM').sum(),
+        (enriched_df['confidence_level'] == 'LOW').sum(),
+        len(enriched_df),
+        (time.monotonic() - _t_start) * 1000,
     )
 
     # FIX 3 (2026-02-17): Log calibration stats for validation

@@ -217,9 +217,35 @@ def mine_v2(session_id):
         # IMPORTANT: Persist any request-body config overrides before triggering the job,
         # so the worker reads the correct config.json.
         try:
+            # FIX 9: Read current status before firing a Cloud Run Job.
+            # Two rapid POSTs to /mine would otherwise launch duplicate jobs
+            # writing to the same GCS prefix.
+            from models.session import _gcp_session_doc  # module-private but same package
+            import json as _json
+            _meta_path = os.path.join(session_path, "meta.json")
+            _current_status = None
+            try:
+                # GCP mode: prefer Firestore as the authoritative status source
+                _doc = _gcp_session_doc(session_id)
+                _current_status = (_doc or {}).get("status")
+            except Exception:
+                # Fallback: local meta.json cache
+                try:
+                    with open(_meta_path) as _f:
+                        _current_status = _json.load(_f).get("status")
+                except (FileNotFoundError, ValueError):
+                    pass
+            if _current_status == "MINING":
+                logger.warning(
+                    "mine_v2 GCP rejected: session %s already MINING", session_id
+                )
+                return jsonify({"error": "Mining already in progress", "status": "MINING"}), 409
+
             request_body = request.get_json(silent=True) or {}
             if request_body:
-                config_dict = merge_configs(DEFAULT_MINING_CONFIG, request_body)
+                # FIX 6 (GCP path): merge overrides on top of saved config, not defaults
+                _saved_config = load_session_config(session_path)
+                config_dict = merge_configs(_saved_config.to_dict(), request_body)
                 config = MiningConfig.from_dict(config_dict)
 
                 validation_errors = config.validate()
@@ -256,12 +282,28 @@ def mine_v2(session_id):
             return jsonify({"error": str(e)}), 500
 
 
+    # FIX 8: Guard against repeated /mine calls on the local path.
+    # Read current status before starting; reject with 409 if already MINING.
+    import json as _json
+    _meta_path = os.path.join(session_path, "meta.json")
+    try:
+        with open(_meta_path) as _f:
+            _current_status = _json.load(_f).get("status", "")
+        if _current_status == "MINING":
+            logger.warning("mine_v2 rejected: session %s already MINING", session_id)
+            return jsonify({"error": "Mining already in progress", "status": "MINING"}), 409
+    except (FileNotFoundError, ValueError):
+        pass  # No meta yet or unreadable — proceed
+
     # Initialize V2 directories
     initialize_session_directories(session_path)
 
-    logger.info(f"Starting mining for session {session_id}")
+    import time as _time
+    _mine_start = _time.monotonic()
+    logger.info("mine_v2 starting: session=%s", session_id)
 
     # Step 1: Load data
+    _t = _time.monotonic()
     logger.info("Step 1: Loading processed data")
     # CHANGE 2026-02-17: Load sparse matrix + indices instead of dense DataFrame
     matrix, user_ids, ent_ids = load_sparse_matrix(session_id)
@@ -271,17 +313,30 @@ def mine_v2(session_id):
     catalog_path = os.path.join(session_path, "processed", "catalog.csv")
     if os.path.isfile(catalog_path):
         catalog = load_dataframe(session_id, "processed/catalog.csv")
-        logger.info(f"Loaded catalog with {len(catalog)} entitlements")
+        logger.info("Loaded catalog: %d entitlements", len(catalog))
 
-    logger.info(f"Loaded matrix: {matrix.shape[0]} users × {matrix.shape[1]} entitlements")
+    logger.info(
+        "Step 1 done: matrix=%d users x %d entitlements  elapsed_ms=%.0f",
+        matrix.shape[0], matrix.shape[1], (_time.monotonic() - _t) * 1000,
+    )
 
-    # Step 2: Merge config (defaults + request body)
-    logger.info("Step 2: Merging configuration")
+    # Step 2: Load saved config, then apply any request-body overrides on top.
+    # FIX 6: previously merged DEFAULT_MINING_CONFIG + request body, discarding
+    # any config.json saved by PUT /config. Now loads config.json first.
+    _t = _time.monotonic()
+    logger.info("Step 2: Loading configuration")
+    config = load_session_config(session_path)
     request_body = request.get_json(silent=True) or {}
-    config_dict = merge_configs(DEFAULT_MINING_CONFIG, request_body)
-    config = MiningConfig.from_dict(config_dict)
+    if request_body:
+        config_dict = merge_configs(config.to_dict(), request_body)
+        config = MiningConfig.from_dict(config_dict)
+        logger.info("Step 2: request-body overrides applied: %s", list(request_body.keys()))
+    else:
+        logger.info("Step 2: using saved config (no request-body overrides)")
+    logger.info("Step 2 done: elapsed_ms=%.0f", (_time.monotonic() - _t) * 1000)
 
     # Step 3: Validate config
+    _t = _time.monotonic()
     logger.info("Step 3: Validating configuration")
     validation_errors = config.validate()
     if validation_errors:
@@ -290,7 +345,7 @@ def mine_v2(session_id):
             "validation_errors": validation_errors,
         }), 400
 
-    # ADDED: Validate that configured user_attributes columns exist in identities.csv
+    # Validate that configured user_attributes columns exist in identities.csv.
     # Hard fail if any column is missing — customer must fix config before mining.
     data_validation_errors = config.validate_against_data(
         identities_columns=list(identities.columns)
@@ -303,16 +358,19 @@ def mine_v2(session_id):
 
     # Save config for reproducibility
     save_session_config(session_path, config)
+    logger.info("Step 3 done: elapsed_ms=%.0f", (_time.monotonic() - _t) * 1000)
 
     # Flatten per-app birthright dict to namespaced list
+    # FIX 7: renamed loop var from ent_ids to ent_list to avoid shadowing the
+    # sparse matrix ent_ids array loaded in Step 1.
     birthright_explicit_flat = []
-    for app_name, ent_ids in config.birthright_explicit.items():
-        for eid in ent_ids:
+    for app_name, ent_list in config.birthright_explicit.items():
+        for eid in ent_list:
             birthright_explicit_flat.append(f"{app_name}:{eid}")
 
     # Step 4: Birthright detection (reuse V1)
+    _t = _time.monotonic()
     logger.info("Step 4: Detecting birthright entitlements")
-    # CHANGE 2026-02-17: Pass sparse matrix with indices
     birthright_result = detect_birthright(
         matrix=matrix,
         user_ids=user_ids,
@@ -321,17 +379,18 @@ def mine_v2(session_id):
         explicit_list=birthright_explicit_flat,
         min_assignment_count=config.min_assignment_count,
     )
-
     logger.info(
-        f"Birthright detection complete: "
-        f"{len(birthright_result['birthright_entitlements'])} birthright, "
-        f"{len(birthright_result.get('noise_entitlements', []))} noise"
+        "Step 4 done: birthright=%d noise=%d kept=%d  elapsed_ms=%.0f",
+        len(birthright_result["birthright_entitlements"]),
+        len(birthright_result.get("noise_entitlements", [])),
+        len(birthright_result["filtered_ent_ids"]),
+        (_time.monotonic() - _t) * 1000,
     )
 
     # Step 5: Entitlement clustering (V2 - Leiden)
+    _t = _time.monotonic()
     logger.info("Step 5: Running Leiden clustering")
     try:
-        # CHANGE 2026-02-17: Pass filtered_ent_ids from birthright result
         cluster_result = cluster_entitlements_leiden(
             matrix=birthright_result["filtered_matrix"],
             ent_ids=birthright_result["filtered_ent_ids"],
@@ -347,28 +406,32 @@ def mine_v2(session_id):
             use_sparse=config.use_sparse_matrices,
         )
     except Exception as e:
-        return jsonify({
-            "error": "Clustering failed",
-            "details": str(e),
-        }), 500
-
+        logger.error("Step 5 clustering failed: %s", e, exc_info=True)
+        return jsonify({"error": "Clustering failed", "details": str(e)}), 500
     logger.info(
-        f"Leiden clustering complete: {cluster_result['n_clusters']} clusters, "
-        f"cpm_quality={cluster_result['leiden_stats']['cpm_quality']:.3f}"
+        "Step 5 done: clusters=%d cpm_quality=%.3f assigned_users=%d  elapsed_ms=%.0f",
+        cluster_result["n_clusters"],
+        cluster_result["leiden_stats"]["cpm_quality"],
+        len(cluster_result["user_cluster_membership"]),
+        (_time.monotonic() - _t) * 1000,
     )
 
     # Step 6: Build roles from clusters (V2)
+    _t = _time.monotonic()
     logger.info("Step 6: Building roles from clusters")
-    # CHANGE 2026-02-17: Pass user_ids and ent_ids for sparse matrix compatibility
     roles_result = build_roles(
         matrix=matrix,
         user_ids=user_ids,
         ent_ids=ent_ids,
         cluster_result=cluster_result,
         birthright_result=birthright_result,
-        identities=identities,
-        catalog=catalog,
         config=config.to_dict(),
+    )
+    logger.info(
+        "Step 6 done: roles=%d residuals=%d  elapsed_ms=%.0f",
+        len(roles_result.get("roles", [])),
+        len(roles_result.get("residuals", [])),
+        (_time.monotonic() - _t) * 1000,
     )
 
     draft_roles = roles_result["roles"]
@@ -400,11 +463,37 @@ def mine_v2(session_id):
     }
 
     # Step 8: Confidence Scoring (V2 - Multi-factor)
+    # FIX 3 wire-in: check user_attributes are configured before attempting scoring.
+    # validate_for_confidence_scoring() enforces the 2-5 count rule that was moved
+    # out of validate() so that mining itself is never blocked.
+    _t = _time.monotonic()
     logger.info("Step 8: Computing multi-factor confidence scores")
+    _scoring_config_errors = config.validate_for_confidence_scoring()
+    if _scoring_config_errors:
+        logger.warning(
+            "Step 8: skipping confidence scoring — user_attributes not configured: %s",
+            _scoring_config_errors,
+        )
+        results["confidence_scoring"] = {
+            "skipped": True,
+            "reason": _scoring_config_errors,
+            "message": "Configure user_attributes via PUT /config to enable confidence scoring",
+        }
+    else:
+        # Load assignments
+        assignments_path = os.path.join(session_path, "processed", "assignments.csv")
+        if not os.path.isfile(assignments_path):
+            logger.warning("Step 8: assignments.csv not found, skipping confidence scoring")
+        elif not CONFIDENCE_SCORER_V2_AVAILABLE:
+            logger.warning("Step 8: confidence_scorer not installed, skipping")
+            results["confidence_scoring"] = {
+                "skipped": True,
+                "reason": "confidence_scorer module not installed",
+            }
 
-    # Load assignments
-    assignments_path = os.path.join(session_path, "processed", "assignments.csv")
-    if os.path.isfile(assignments_path):
+    # Scoring block — only runs when user_attributes valid and scorer available
+    if os.path.isfile(os.path.join(session_path, "processed", "assignments.csv"))             and CONFIDENCE_SCORER_V2_AVAILABLE             and not _scoring_config_errors:
+        assignments_path = os.path.join(session_path, "processed", "assignments.csv")
         assignments_df = load_dataframe(session_id, "processed/assignments.csv").reset_index(drop=True)
 
         if CONFIDENCE_SCORER_V2_AVAILABLE:
@@ -489,25 +578,29 @@ def mine_v2(session_id):
                 "error": "confidence_scorer_v2 not installed",
                 "message": "Install services/confidence_scorer.py for scoring"
             }
-    else:
-        logger.warning("No assignments.csv found, skipping confidence scoring")
 
-    # Step 9: Save results to results/
-    results_path = get_results_path(session_path)
+    # Step 9: Save results
+    _t = _time.monotonic()
+    logger.info("Step 9: Saving results")
     save_json(session_id, "results/draft_results.json", results)
-
-    update_session_fields(session_id, {"status": "MINED"})
-    sync_session_tree(session_id)
-
-
-    # Save cluster assignments for future drift detection
-    # (Store user_cluster_membership for daily comparison)
+    # Save cluster membership before sync so it is included in the GCS upload.
+    # (Previously this was after sync_session_tree, so it was never persisted to GCS.)
     save_json(
         session_id,
         "results/cluster_membership.json",
         cluster_result["user_cluster_membership"],
     )
-
+    update_session_fields(session_id, {"status": "MINED"})
+    sync_session_tree(session_id)
+    logger.info(
+        "Step 9 done: elapsed_ms=%.0f", (_time.monotonic() - _t) * 1000
+    )
+    logger.info(
+        "mine_v2 complete: session=%s total_elapsed_ms=%.0f roles=%d",
+        session_id,
+        (_time.monotonic() - _mine_start) * 1000,
+        len(results.get("roles", [])),
+    )
     return jsonify(results), 200
 
 
