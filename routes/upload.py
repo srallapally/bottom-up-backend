@@ -7,10 +7,14 @@ from models.session import (
     create_session,
     get_session_path,
     sync_file,
+    save_json,
     list_sessions,
     session_owner_sub,
     update_session_fields,
     sync_session_tree,
+    META_FILENAME,
+    _use_gcp_backend,
+    _gcp_session_doc,
 )
 from services.data_loader import process_upload
 from services.auth import require_auth
@@ -395,22 +399,36 @@ def process_files(session_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    # FIX 14: Write stats.json directly rather than via save_json().
-    # save_json() calls sync_file() internally, which would upload stats.json to GCS.
-    # sync_session_tree() below then uploads it again as part of the full tree sync.
-    # Writing directly avoids the redundant upload.
-    import json as _json
-    _stats_path = os.path.join(session_path, "processed", "stats.json")
-    with open(_stats_path, "w") as _f:
-        _json.dump(stats, _f, indent=2)
+    save_json(session_id, "processed/stats.json", stats)
 
-    # Persist all files written by process_upload() (matrix.npz, CSVs, stats.json).
+    # Persist any files written by process_upload() when using the GCP storage backend.
     sync_session_tree(session_id)
 
     return jsonify({
         "session_id": session_id,
         "stats": stats
     }), 200
+
+
+def _read_session_status(session_id: str, session_path: str) -> str | None:
+    """Read the authoritative session status string.
+
+    GCP: Firestore (source of truth, written by worker and Flask routes).
+    Local: meta.json in session directory.
+    Returns None if unreadable.
+    """
+    try:
+        if _use_gcp_backend():
+            doc = _gcp_session_doc(session_id)
+            return (doc or {}).get("status")
+        else:
+            meta_path = os.path.join(session_path, META_FILENAME)
+            if os.path.isfile(meta_path):
+                with open(meta_path) as f:
+                    return json.load(f).get("status")
+    except Exception:
+        pass
+    return None
 
 
 # -------------------------
@@ -451,10 +469,22 @@ def session_status(session_id):
             pass
 
     has_config = os.path.isfile(os.path.join(session_path, "config.json"))
-    has_results = os.path.isfile(os.path.join(session_path, "results", "draft_results.json"))
+    results_path = os.path.join(session_path, "results", "draft_results.json")
+    has_results = os.path.isfile(results_path)
+    status = _read_session_status(session_id, session_path)
+
+    # Augment stats with roles_discovered from results if available
+    if stats is not None and has_results:
+        try:
+            with open(results_path) as f:
+                _results = json.load(f)
+            stats["roles_discovered"] = len(_results.get("roles", [])) + (1 if _results.get("birthright_role") else 0)
+        except Exception:
+            pass
 
     return jsonify({
         "session_id": session_id,
+        "status": status,
         "uploaded_files": uploaded_files,
         "uploaded_files_info": uploaded_files_info,
         "has_processed": stats is not None,

@@ -539,7 +539,7 @@ def _compute_individual_scores(
     df["cluster_id"] = None
     df["cluster_size"] = 0
     df["peers_with_entitlement"] = 0
-    df["peer_users"] = ""  # Comma-separated list of peer user IDs
+
     df["role_covered"] = False
     df["entitlement_tier"] = "residual"  # NEW: core/common/residual/birthright
     df["matched_role_id"] = ""  # NEW: which role matched this entitlement
@@ -596,25 +596,19 @@ def _compute_peer_group_scores(
     """
     Compute peer group prevalence scores using role-based peer groups.
 
-    For each user-entitlement assignment:
-    - Find which of the user's roles contains this entitlement
-    - If multiple roles, pick the one with highest prevalence
-    - Use that role's members as the peer group
-    - Compute leave-one-out prevalence score
-    - Tag with entitlement_tier (core/common/birthright/residual)
+    Vectorized: builds a (user_id, ent_id) lookup dict from the role structures,
+    then assigns all columns in bulk rather than row-by-row.
     """
     user_memberships = cluster_result["user_cluster_membership"]
     birthright_set = set(birthright_entitlements)
 
-    # Build user -> set of role_ids for quick membership check
-    # Map role_id -> seed_cluster_id for lookup
-    user_role_ids: Dict[str, set] = {}
-    for user_id, memberships in user_memberships.items():
-        user_role_ids[user_id] = {
-            f"ROLE_{m['cluster_id']:03d}" for m in memberships
-        }
+    # user -> set of role_ids
+    user_role_ids: Dict[str, set] = {
+        user_id: {f"ROLE_{m['cluster_id']:03d}" for m in memberships}
+        for user_id, memberships in user_memberships.items()
+    }
 
-    # Pre-compute per-role entitlement sums for leave-one-out
+    # Pre-compute per-role entitlement sums for leave-one-out (unchanged — small structure)
     role_ent_sums: Dict[str, pd.Series] = {}
     for role_entries in ent_role_lookup.values():
         for entry in role_entries:
@@ -622,77 +616,94 @@ def _compute_peer_group_scores(
             if rid not in role_ent_sums:
                 members = entry["members"]
                 valid_members = [m for m in members if m in full_matrix.index]
-                if valid_members:
-                    role_ent_sums[rid] = full_matrix.loc[valid_members].sum(axis=0)
-                else:
-                    role_ent_sums[rid] = pd.Series(0, index=full_matrix.columns)
+                role_ent_sums[rid] = (
+                    full_matrix.loc[valid_members].sum(axis=0)
+                    if valid_members
+                    else pd.Series(0, index=full_matrix.columns)
+                )
 
-    for idx, row in df.iterrows():
-        user_id = row["USR_ID"]
-        ent_id = row[ent_col]
+    # Build (user_id, ent_id) -> result dict in one pass over the lookup structures.
+    # Only covers non-birthright, non-residual rows — defaults handle the rest.
+    lookup: Dict[tuple, Dict[str, Any]] = {}
+    for ent_id, role_entries in ent_role_lookup.items():
+        for entry in role_entries:
+            role_id = entry["role_id"]
+            member_count = entry["member_count"]
+            tier = entry["tier"]
+            prevalence = entry["prevalence"]
+            ent_sums = role_ent_sums.get(role_id)
 
-        # Birthright check first
+            for user_id in entry["members"]:
+                key = (user_id, ent_id)
+                # Keep only the best (highest prevalence) role per (user, ent) pair
+                if key in lookup and lookup[key]["prevalence"] >= prevalence:
+                    continue
+                lookup[key] = {
+                    "role_id": role_id,
+                    "tier": tier,
+                    "member_count": member_count,
+                    "prevalence": prevalence,
+                    "ent_sums": ent_sums,
+                }
+
+    # Vectorized assignment
+    keys = list(zip(df["USR_ID"], df[ent_col]))
+
+    tiers = []
+    role_ids = []
+    cluster_sizes = []
+    role_covered = []
+    peer_group_scores = []
+    peers_with_list = []
+
+    for user_id, ent_id in keys:
+        # Birthright
         if ent_id in birthright_set:
-            df.at[idx, "entitlement_tier"] = "birthright"
-            df.at[idx, "peer_group_score"] = 1.0
-            df.at[idx, "role_covered"] = True
+            tiers.append("birthright")
+            role_ids.append("")
+            cluster_sizes.append(0)
+            role_covered.append(True)
+            peer_group_scores.append(1.0)
+            peers_with_list.append(0)
             continue
 
-        # Find roles containing this entitlement
-        role_entries = ent_role_lookup.get(ent_id, [])
-        if not role_entries:
-            # Residual: not in any role
-            df.at[idx, "entitlement_tier"] = "residual"
+        entry = lookup.get((user_id, ent_id))
+        if entry is None:
+            tiers.append("residual")
+            role_ids.append("")
+            cluster_sizes.append(0)
+            role_covered.append(False)
+            peer_group_scores.append(0.0)
+            peers_with_list.append(0)
             continue
 
-        # Find the user's roles
-        user_roles = user_role_ids.get(user_id, set())
-        if not user_roles:
-            df.at[idx, "entitlement_tier"] = "residual"
-            continue
+        role_id = entry["role_id"]
+        member_count = entry["member_count"]
+        ent_sums = entry["ent_sums"]
 
-        # Find matching roles (roles that contain this ent AND the user belongs to)
-        matching = [e for e in role_entries if e["role_id"] in user_roles]
+        tiers.append(entry["tier"])
+        role_ids.append(role_id)
+        cluster_sizes.append(member_count)
+        role_covered.append(True)
 
-        if not matching:
-            # Entitlement is in some role(s), but not in any of THIS user's roles
-            df.at[idx, "entitlement_tier"] = "residual"
-            continue
-
-        # Pick the role with highest prevalence for this entitlement
-        best = max(matching, key=lambda e: e["prevalence"])
-
-        role_id = best["role_id"]
-        tier = best["tier"]
-        member_count = best["member_count"]
-
-        df.at[idx, "entitlement_tier"] = tier
-        df.at[idx, "matched_role_id"] = role_id
-        df.at[idx, "cluster_size"] = member_count
-        df.at[idx, "role_covered"] = True
-
-        # Get list of peer users (all members of this role except current user)
-        peer_user_list = [m for m in best["members"] if m != user_id]
-        # Limit to first 100 peers to avoid huge strings
-        df.at[idx, "peer_users"] = ",".join(peer_user_list[:100])
-
-        # Leave-one-out peer score
-        if member_count <= 1:
-            df.at[idx, "peer_group_score"] = 0.0
-            continue
-
-        ent_sums = role_ent_sums.get(role_id)
-        if ent_sums is None or ent_id not in ent_sums.index:
+        if member_count <= 1 or ent_sums is None or ent_id not in ent_sums.index:
+            peer_group_scores.append(0.0)
+            peers_with_list.append(0)
             continue
 
         user_has = _matrix_at(full_matrix, user_id, ent_id)
-        peers_with = int(ent_sums[ent_id] - user_has)
+        peers_with = int(ent_sums[ent_id]) - user_has
         peer_count = member_count - 1
+        score = round(peers_with / peer_count, 4) if peer_count > 0 else 0.0
+        peer_group_scores.append(score)
+        peers_with_list.append(peers_with)
 
-        score = peers_with / peer_count if peer_count > 0 else 0.0
-
-        df.at[idx, "peer_group_score"] = round(score, 4)
-        df.at[idx, "peers_with_entitlement"] = peers_with
+    df["entitlement_tier"] = tiers
+    df["matched_role_id"] = role_ids
+    df["cluster_size"] = cluster_sizes
+    df["role_covered"] = role_covered
+    df["peer_group_score"] = peer_group_scores
+    df["peers_with_entitlement"] = peers_with_list
 
     return df
 
@@ -708,57 +719,97 @@ def _compute_attribute_scores(
     """
     Compute user attribute prevalence scores.
 
-    CHANGED: iterates over customer-configured user_attributes
-    instead of hardcoded department/job_title/location/manager.
+    Vectorized: merges identities onto df once, then maps prevalence
+    scores via a combined (attr_value, ent_id) key per attribute column.
+    Leave-one-out correction applied in bulk for rows where user has the entitlement.
     """
-    # CHANGED: use _get_user_attribute_config helper
     attr_columns, _ = _get_user_attribute_config(config)
+    if not attr_columns:
+        return df
 
-    for idx, row in df.iterrows():
-        user_id = row["USR_ID"]
-        ent_id = row[ent_col]
+    present_cols = [c for c in attr_columns if c in identities.columns]
+    if not present_cols:
+        return df
 
-        if user_id not in identities.index:
+    # Merge identities attr columns onto df once (left join on USR_ID)
+    id_cols = ["USR_ID"] + present_cols
+    df = df.merge(
+        identities[id_cols].drop_duplicates("USR_ID"),
+        on="USR_ID",
+        how="left",
+        suffixes=("", "_id_attr"),
+    )
+
+    # user_has_ent: boolean Series — does this user have this entitlement?
+    # Used for leave-one-out correction across all attribute columns.
+    def _user_has(user_id, ent_id):
+        return _matrix_at(full_matrix, user_id, ent_id)
+
+    user_has_ent = pd.Series(
+        [_user_has(u, e) for u, e in zip(df["USR_ID"], df[ent_col])],
+        index=df.index,
+        dtype=int,
+    )
+
+    for col_name in present_cols:
+        score_col = f"{col_name}_score"
+
+        # Build (attr_value, ent_id) -> (total, with_ent) lookup from prevalence dict
+        # Keys in attribute_prevalence: (col_name, str(attr_value), ent_id)
+        col_prev = {
+            (attr_val, ent_id): (v["total_users"], v["users_with_ent"])
+            for (cn, attr_val, ent_id), v in attribute_prevalence.items()
+            if cn == col_name
+        }
+
+        if not col_prev:
             continue
 
-        skipped = []
+        attr_vals = df[col_name].astype(str)
+        ent_vals = df[ent_col]
 
-        # CHANGED: iterate over customer's configured columns
-        for col_name in attr_columns:
-            score_col = f"{col_name}_score"
+        # Map (attr_value, ent_id) -> base score (without leave-one-out)
+        total_arr = np.empty(len(df), dtype=float)
+        with_ent_arr = np.empty(len(df), dtype=float)
+        for i, key in enumerate(zip(attr_vals, ent_vals)):
+            entry = col_prev.get(key)
+            if entry:
+                total_arr[i] = entry[0]
+                with_ent_arr[i] = entry[1]
+            else:
+                total_arr[i] = np.nan
+                with_ent_arr[i] = np.nan
 
-            if col_name not in identities.columns:
-                continue
+        # Apply leave-one-out correction where user has the entitlement
+        has_mask = user_has_ent.to_numpy(dtype=bool)
+        with_ents_adj = with_ent_arr.copy()
+        totals_adj = total_arr.copy()
+        with_ents_adj[has_mask] -= 1
+        totals_adj[has_mask] -= 1
 
-            attr_value = identities.at[user_id, col_name]
+        # Compute score, guard division by zero
+        with np.errstate(invalid="ignore", divide="ignore"):
+            scores = np.where(
+                totals_adj > 0,
+                np.round(with_ents_adj / totals_adj, 4),
+                np.nan,
+            )
 
-            # Handle NULL
-            if pd.isna(attr_value) or attr_value == "":
-                skipped.append(col_name)
-                continue
+        # Only set where we had a valid prevalence entry and attr is non-null/non-empty
+        null_mask = df[col_name].isna() | (df[col_name].astype(str) == "")
+        valid = ~null_mask.to_numpy() & ~np.isnan(total_arr)
+        df[score_col] = np.where(valid, scores, np.nan)
 
-            # Lookup pre-computed prevalence
-            # CHANGED: key uses col_name directly (matches _precompute key format)
-            key = (col_name, str(attr_value), ent_id)
-            if key not in attribute_prevalence:
-                # Attribute value exists but no prevalence data
-                # (could be rare value or entitlement)
-                continue
+        # Track skipped (null attr value) for attributes_skipped column
+        skipped_mask = null_mask & df["USR_ID"].isin(full_matrix.index)
+        if skipped_mask.any():
+            # Append col_name to attributes_skipped for affected rows
+            df.loc[skipped_mask, "attributes_skipped"] = df.loc[
+                skipped_mask, "attributes_skipped"
+            ].apply(lambda s: f"{s}, {col_name}" if s else col_name)
 
-            prev_data = attribute_prevalence[key]
-            total = prev_data["total_users"]
-            with_ent = prev_data["users_with_ent"]
-
-            # Leave-one-out correction
-            if _matrix_at(full_matrix, user_id, ent_id):
-                with_ent -= 1
-                total -= 1
-
-            score = with_ent / total if total > 0 else 0.0
-            df.at[idx, score_col] = round(score, 4)
-
-        if skipped:
-            df.at[idx, "attributes_skipped"] = ", ".join(skipped)
+    # Drop the merged identity attr columns — they were temp
+    df = df.drop(columns=present_cols, errors="ignore")
 
     return df
 
@@ -862,90 +913,100 @@ def _compute_weighted_confidence(
         for col_name in attr_columns:
             base_weights[col_name] = attr_weights.get(col_name, 0) * attr_budget
 
-    # Initialize result columns
-    df["confidence"] = 0.0
-    df["confidence_level"] = "LOW"
-    df["justification"] = ""
-    df["weights_used"] = ""
+    # -------------------------------------------------------------------------
+    # Vectorized confidence computation
+    # -------------------------------------------------------------------------
 
-    for idx, row in df.iterrows():
-        user_id = row["USR_ID"]
+    # Collect factor score columns and their base weights
+    factor_cols: Dict[str, str] = {"peer_group": "peer_group_score"}
+    factor_weights: Dict[str, float] = {"peer_group": base_weights["peer_group"]}
 
-        # Collect available scores
-        available_scores = {}
+    for col_name in attr_columns:
+        score_col = f"{col_name}_score"
+        if score_col in df.columns:
+            factor_cols[col_name] = score_col
+            factor_weights[col_name] = base_weights.get(col_name, 0.0)
 
-        # Peer group
-        if pd.notna(row["peer_group_score"]):
-            available_scores["peer_group"] = row["peer_group_score"]
+    if use_drift and "drift_stability_score" in df.columns:
+        factor_cols["drift_stability"] = "drift_stability_score"
+        factor_weights["drift_stability"] = drift_weight
 
-        # CHANGED: dynamic attribute columns instead of hardcoded list
-        for col_name in attr_columns:
-            score_col = f"{col_name}_score"
-            if score_col in df.columns and pd.notna(row[score_col]):
-                available_scores[col_name] = row[score_col]
-
-        # Drift stability
-        if use_drift and pd.notna(row["drift_stability_score"]):
-            available_scores["drift_stability"] = row["drift_stability_score"]
-
-        # Role coverage — only for non-residual entitlements.
-        # Residuals have peer_group_score=0.0 by definition; adding a user-level
-        # coverage bonus here would inflate confidence on outlier entitlements.
-        if use_role_cov and user_id in user_role_coverage and row.get("entitlement_tier") != "residual":
-            available_scores["role_coverage"] = user_role_coverage[user_id]
-
-        # Compute weighted confidence
-        if not available_scores:
-            # No scores available
-            df.at[idx, "confidence"] = 0.0
-            df.at[idx, "confidence_level"] = "LOW"
-            df.at[idx, "justification"] = "No confidence factors available"
-            continue
-
-        # Build weights for available scores
-        weights_used = {}
-        for factor_name in available_scores:
-            if factor_name in base_weights:
-                weights_used[factor_name] = base_weights[factor_name]
-            elif factor_name == "drift_stability":
-                weights_used[factor_name] = drift_weight
-            elif factor_name == "role_coverage":
-                weights_used[factor_name] = role_cov_weight
-
-        # Re-normalize if enabled
-        if renormalize and weights_used:
-            total = sum(weights_used.values())
-            if total > 0:
-                weights_used = {k: v / total for k, v in weights_used.items()}
-
-        # Weighted sum
-        confidence = sum(
-            available_scores[factor] * weights_used.get(factor, 0)
-            for factor in available_scores
+    # Role coverage: user-level value, only for non-residual rows
+    role_cov_series = None
+    if use_role_cov and user_role_coverage:
+        role_cov_series = df["USR_ID"].map(user_role_coverage)
+        # Zero out residual rows
+        role_cov_series = role_cov_series.where(
+            df["entitlement_tier"] != "residual", other=np.nan
         )
 
-        confidence = round(confidence, 4)
+    # Build score matrix (rows × factors), NaN where factor unavailable
+    score_parts: Dict[str, pd.Series] = {}
+    weight_parts: Dict[str, pd.Series] = {}
 
-        # Confidence level
-        if confidence >= high_thresh:
-            level = "HIGH"
-        elif confidence >= medium_thresh:
-            level = "MEDIUM"
-        else:
-            level = "LOW"
+    for factor_name, score_col in factor_cols.items():
+        s = df[score_col].copy()
+        score_parts[factor_name] = s
+        # Weight is constant per factor, but masked to NaN where score is NaN
+        weight_parts[factor_name] = pd.Series(
+            np.where(s.notna(), factor_weights[factor_name], np.nan),
+            index=df.index,
+        )
 
-        # Justification
-        justification = _build_justification(
-            confidence=confidence,
+    if role_cov_series is not None:
+        score_parts["role_coverage"] = role_cov_series
+        weight_parts["role_coverage"] = pd.Series(
+            np.where(role_cov_series.notna(), role_cov_weight, np.nan),
+            index=df.index,
+        )
+
+    score_matrix = pd.DataFrame(score_parts, index=df.index)
+    weight_matrix = pd.DataFrame(weight_parts, index=df.index)
+
+    if renormalize:
+        weight_totals = weight_matrix.sum(axis=1)
+        weight_matrix = weight_matrix.div(weight_totals, axis=0)
+
+    confidence = (score_matrix * weight_matrix).sum(axis=1).round(4)
+    # Rows where all scores are NaN → no factors available
+    no_factors = score_matrix.isna().all(axis=1)
+    confidence = confidence.where(~no_factors, other=0.0)
+
+    confidence_level = pd.cut(
+        confidence,
+        bins=[-np.inf, medium_thresh, high_thresh, np.inf],
+        labels=["LOW", "MEDIUM", "HIGH"],
+    ).astype(str)
+    confidence_level = confidence_level.where(~no_factors, other="LOW")
+
+    df["confidence"] = confidence
+    df["confidence_level"] = confidence_level
+    df["weights_used"] = str(factor_weights)  # same for all rows
+
+    # Justification: row-wise string, use apply on minimal columns
+    just_cols = [
+        "USR_ID", "entitlement_tier", "matched_role_id",
+        "peers_with_entitlement", "cluster_size", "global_prevalence",
+    ] + list(score_cols for score_cols in [f"{c}_score" for c in attr_columns] if score_cols in df.columns)
+
+    def _make_justification(row):
+        if no_factors[row.name]:
+            return "No confidence factors available"
+        available_scores = {
+            factor: row[score_col]
+            for factor, score_col in factor_cols.items()
+            if pd.notna(row.get(score_col, np.nan))
+        }
+        if role_cov_series is not None and pd.notna(role_cov_series[row.name]):
+            available_scores["role_coverage"] = role_cov_series[row.name]
+        return _build_justification(
+            confidence=confidence[row.name],
             available_scores=available_scores,
-            weights_used=weights_used,
+            weights_used=factor_weights,
             row=row,
         )
 
-        df.at[idx, "confidence"] = confidence
-        df.at[idx, "confidence_level"] = level
-        df.at[idx, "justification"] = justification
-        df.at[idx, "weights_used"] = str(weights_used)
+    df["justification"] = df.apply(_make_justification, axis=1)
 
     return df
 

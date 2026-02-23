@@ -188,6 +188,7 @@ def build_roles(
     logger.info("Step 9: Building birthright role and summary statistics")
     birthright_role = _build_birthright_role(
         birthright_result=birthright_result,
+        user_ids=user_ids,
     )
 
     multi_cluster_info = _compute_multi_cluster_stats(
@@ -537,16 +538,47 @@ def _compute_coverage_distribution(member_coverage: Dict[str, Dict]) -> Dict[str
 
 def _build_birthright_role(
         birthright_result: Dict[str, Any],
+        user_ids,
 ) -> Dict[str, Any]:
-    """Build birthright role from detection results."""
+    """Build birthright role from detection results.
+
+    Returns a role object with the same shape as mined roles so the
+    frontend detail view can render it without special-casing.
+    All users are members at 100% coverage by definition.
+    """
     birthright_ents = birthright_result["birthright_entitlements"]
     birthright_stats = birthright_result["birthright_stats"]
+
+    all_users = list(user_ids)
+    n_ents = len(birthright_ents)
+
+    member_coverage = {
+        uid: {
+            "coverage": 1.0,
+            "has_count": n_ents,
+            "total_count": n_ents,
+            "missing": [],
+        }
+        for uid in all_users
+    }
 
     return {
         "role_id": "ROLE_BIRTHRIGHT",
         "role_name": "Organization-Wide Baseline Access",
         "entitlements": birthright_ents,
-        "entitlement_count": len(birthright_ents),
+        "core_entitlements": birthright_ents,
+        "common_entitlements": [],
+        "entitlement_count": n_ents,
+        "members": all_users,
+        "member_count": len(all_users),
+        "member_coverage": member_coverage,
+        "avg_coverage": 1.0,
+        "min_coverage": 1.0,
+        "max_coverage": 1.0,
+        "coverage_distribution": {"1.00": len(all_users)},
+        "entitlement_prevalence": {e: 1.0 for e in birthright_ents},
+        "hr_summary": {},
+        "status": "birthright",
         "stats": birthright_stats,
     }
 

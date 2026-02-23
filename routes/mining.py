@@ -14,6 +14,7 @@ New endpoints for V2 hybrid approach:
 V1 endpoints remain unchanged in routes/mining.py
 """
 
+import json
 import os
 import sys
 import logging
@@ -56,6 +57,8 @@ from models.session import (
     session_owner_sub,
     update_session_fields,
     sync_session_tree,
+    sync_file,
+    fetch_file,
 )
 from services.birthright import detect_birthright
 from services.clustering import cluster_entitlements_leiden
@@ -165,6 +168,7 @@ def save_config_v2(session_id):
 
     # Save
     save_session_config(session_path, config)
+    sync_file(session_id, "config.json")
 
     return jsonify(config.to_dict()), 200
 
@@ -266,6 +270,7 @@ def mine_v2(session_id):
                     }), 400
 
                 save_session_config(session_path, config)
+                sync_file(session_id, "config.json")
 
             update_session_fields(session_id, {"status": "MINING"})
             op = run_mine_job(session_id=session_id, owner_sub=g.user["sub"])
@@ -325,6 +330,7 @@ def mine_v2(session_id):
     # any config.json saved by PUT /config. Now loads config.json first.
     _t = _time.monotonic()
     logger.info("Step 2: Loading configuration")
+    fetch_file(session_id, "config.json")
     config = load_session_config(session_path)
     request_body = request.get_json(silent=True) or {}
     if request_body:
@@ -358,6 +364,7 @@ def mine_v2(session_id):
 
     # Save config for reproducibility
     save_session_config(session_path, config)
+    sync_file(session_id, "config.json")
     logger.info("Step 3 done: elapsed_ms=%.0f", (_time.monotonic() - _t) * 1000)
 
     # Flatten per-app birthright dict to namespaced list
@@ -583,6 +590,25 @@ def mine_v2(session_id):
     _t = _time.monotonic()
     logger.info("Step 9: Saving results")
     save_json(session_id, "results/draft_results.json", results)
+
+    # Patch stats.json with role count so the dashboard can display it
+    # fetch_file ensures we have the latest copy from GCS (cache may be stale)
+    try:
+        logger.info("Step 9: Patching stats.json")
+        fetch_file(session_id, "processed/stats.json")
+    except Exception:
+        pass  # file may not exist yet; isfile check below handles it
+    _stats_path = os.path.join(session_path, "processed", "stats.json")
+    if os.path.isfile(_stats_path):
+        try:
+            with open(_stats_path) as _f:
+                _stats = json.load(_f)
+            _stats["roles_discovered"] = summary_base.get("total_roles", 0)
+            with open(_stats_path, "w") as _f:
+                json.dump(_stats, _f, indent=2)
+            sync_file(session_id, "processed/stats.json")
+        except Exception as _e:
+            logger.warning("Failed to patch stats.json with roles_discovered: %s", _e, exc_info=True)
     # Save cluster membership before sync so it is included in the GCS upload.
     # (Previously this was after sync_session_tree, so it was never persisted to GCS.)
     save_json(
