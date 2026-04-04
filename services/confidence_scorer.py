@@ -582,7 +582,15 @@ def _compute_attribute_scores(df, identities, full_matrix, attribute_prevalence,
 
 
 def _compute_drift_stability_scores(df, drift_data, ent_col):
-    """Stub: all entitlements are stable (score = 1.0)."""
+    # NOT IMPLEMENTED — returns 1.0 (maximum stability) for every entitlement.
+    # This value is currently never used in practice because the call site at line 409
+    # gates on `drift_data` being non-None, and the renormalize path drops the column
+    # before it influences the final score.  Replace this stub before enabling drift
+    # stability weighting in production.
+    logger.warning(
+        "_compute_drift_stability_scores called with real drift_data but is not "
+        "implemented; all entitlements will receive drift_stability_score=1.0"
+    )
     df["drift_stability_score"] = 1.0
     return df
 
