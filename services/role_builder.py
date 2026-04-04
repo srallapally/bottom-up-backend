@@ -42,11 +42,13 @@ def build_roles(
         cluster_result: Dict[str, Any],
         birthright_result: Dict[str, Any],
         config: Optional[Dict[str, Any]] = None,
+        tiered_birthright_roles: Optional[List[Dict]] = None,  # CHANGE 2026-04-02
 ) -> Dict[str, Any]:
     """
     Build role definitions from entitlement clusters with two-tier prevalence.
 
     CHANGE 2026-02-17: Updated to work with sparse matrix + indices.
+    CHANGE 2026-04-02: Added tiered_birthright_roles for residual coverage.
 
     Args:
         matrix: scipy.sparse.csr_matrix (users × entitlements)
@@ -55,6 +57,7 @@ def build_roles(
         cluster_result: Output from cluster_entitlements_leiden()
         birthright_result: Output from detect_birthright()
         config: Config dict with user_attributes and prevalence thresholds
+        tiered_birthright_roles: List of tiered birthright role dicts (from Step 4.5)
 
     Returns:
         dict with:
@@ -76,7 +79,12 @@ def build_roles(
 
     birthright_ents = set(birthright_result["birthright_entitlements"])
     noise_ents = set(birthright_result.get("noise_entitlements", []))
-    excluded_ents = birthright_ents | noise_ents
+    # Tiered birthright entitlements are already explained by Step 4.5;
+    # exclude them from prevalence so they don't inflate into core/common.
+    tiered_br_ents = set()
+    for tbr in (tiered_birthright_roles or []):
+        tiered_br_ents.update(tbr["entitlements"])
+    excluded_ents = birthright_ents | noise_ents | tiered_br_ents
 
     # ---- Step 1: Build seed roles from clusters ----
     min_entitlements = config.get("min_entitlements_per_role", 2)
@@ -173,6 +181,7 @@ def build_roles(
         role["entitlement_count"] = len(role["core_entitlements"])
 
     # ---- Step 8: Residuals against expanded core sets ----
+    # CHANGE 2026-04-02: Pass tiered_birthright_roles for residual coverage
     logger.info("Step 8: Computing residual access against core entitlement sets")
     # CHANGE 2026-02-17: Pass user_ids and ent_ids
     residuals = _compute_residuals_v2(
@@ -182,6 +191,7 @@ def build_roles(
         roles=roles,
         user_memberships=user_memberships,
         birthright_entitlements=list(birthright_ents),
+        tiered_birthright_roles=tiered_birthright_roles or [],
     )
 
     # ---- Step 9: Birthright role, summary, stats ----
@@ -252,15 +262,6 @@ def _compute_prevalence_matrix(
 
     Operation: prevalence = (R.T @ M) / role_sizes
     Where R is a sparse (users x roles) membership matrix.
-
-    Returns a dict so the result stays sparse (never densifies n_roles x n_ents):
-        {
-            "prevalence_csr": csr_matrix (n_roles x n_ents),  # values in [0, 1]
-            "role_id_to_row": {role_id: row_index},
-            "ent_id_to_col": {ent_id: col_index},
-            "ent_ids": list[str],
-        }
-    Excluded entitlements (birthright + noise) have prevalence = 0 (dropped).
     """
     if not roles:
         return {
@@ -339,13 +340,6 @@ def _classify_entitlement_tiers(
     """
     Classify entitlements into core/common tiers for each role.
     Mutates role dicts in-place to add tier fields.
-
-    Tiers:
-    - Core: seed entitlements (always, even if low prevalence) +
-            non-seed entitlements with prevalence >= prevalence_threshold
-    - Common: non-seed entitlements with prevalence >= association_threshold
-              and < prevalence_threshold
-    - Low-prevalence seeds: seeds with prevalence < prevalence_threshold (flagged)
     """
     prevalence_threshold = config.get("entitlement_prevalence_threshold", 0.75)
     association_threshold = config.get("entitlement_association_threshold", 0.40)
@@ -414,12 +408,6 @@ def _detect_birthright_promotions(
 ) -> List[Dict[str, Any]]:
     """
     Detect entitlements that are core in a high percentage of all roles.
-    These are candidates for escalation to the birthright role.
-
-    Does NOT auto-move. Surfaces as a recommendation.
-
-    Returns:
-        List of {entitlement_id, core_in_roles, total_roles, pct}
     """
     threshold = config.get("birthright_promotion_threshold", 0.50)
     n_roles = len(roles)
@@ -457,10 +445,6 @@ def _compute_role_overlap(
 ) -> List[Dict[str, Any]]:
     """
     Compute Jaccard similarity of core entitlement sets between all role pairs.
-    Flag pairs above the merge similarity threshold.
-
-    Returns:
-        List of {role_a, role_b, jaccard, shared_core_count, shared_core}
     """
     threshold = config.get("role_merge_similarity_threshold", 0.70)
     n_roles = len(roles)
@@ -496,10 +480,6 @@ def _compute_role_overlap(
     merge_candidates.sort(key=lambda x: -x["jaccard"])
     return merge_candidates
 
-
-# ============================================================================
-# HR ATTRIBUTE SUMMARIZATION
-# ============================================================================
 
 # ============================================================================
 # COVERAGE STATISTICS
@@ -540,12 +520,7 @@ def _build_birthright_role(
         birthright_result: Dict[str, Any],
         user_ids,
 ) -> Dict[str, Any]:
-    """Build birthright role from detection results.
-
-    Returns a role object with the same shape as mined roles so the
-    frontend detail view can render it without special-casing.
-    All users are members at 100% coverage by definition.
-    """
+    """Build birthright role from detection results."""
     birthright_ents = birthright_result["birthright_entitlements"]
     birthright_stats = birthright_result["birthright_stats"]
 
@@ -588,27 +563,44 @@ def _build_birthright_role(
 # ============================================================================
 
 def _compute_residuals_v2(
-        matrix,  # CHANGE 2026-02-17: Now csr_matrix
-        user_ids,  # CHANGE 2026-02-17: User IDs
-        ent_ids,  # CHANGE 2026-02-17: Entitlement IDs
-        roles: List[Dict],
-        user_memberships: Dict[str, List[Dict]],
-        birthright_entitlements: List[str],
-) -> List[Dict[str, str]]:
+        matrix,
+        user_ids,
+        ent_ids,
+        roles,
+        user_memberships,
+        birthright_entitlements,
+        tiered_birthright_roles=None,
+):
     """
-    Compute residual access (entitlements not covered by roles or birthright).
+    Compute residual access (entitlements not covered by roles, birthright,
+    or tiered birthrights).
 
-    CHANGE 2026-02-17: Updated to work with sparse matrix + indices.
+    CHANGE 2026-04-02: Added tiered_birthright_roles to coverage set.
 
-    Uses core_entitlements (expanded) for coverage check.
-    Multi-cluster membership means UNION of all assigned roles' core sets.
+    Coverage set per user:
+        covered = universal_birthright_ents
+                  ∪ tiered_birthright_ents
+                  ∪ {role core ents for each role user is assigned to}
+
+        residuals = user's actual entitlements - covered
+
+    Note: without identities in this function, tiered entitlements are treated
+    as covered for ALL holders (slightly over-generous). The confidence scorer
+    handles precise per-user criteria matching.
     """
+    tiered_birthright_roles = tiered_birthright_roles or []
+
     cluster_to_core = {}
     for role in roles:
         cluster_id = role["seed_cluster_id"]
         cluster_to_core[cluster_id] = set(role["core_entitlements"])
 
     birthright_set = set(birthright_entitlements)
+
+    # Build global tiered entitlement set
+    tiered_ent_set = set()
+    for role in tiered_birthright_roles:
+        tiered_ent_set.update(role["entitlements"])
 
     user_idx_map = {uid: i for i, uid in enumerate(user_ids)}
     ent_ids_array = np.array(ent_ids)
@@ -622,7 +614,7 @@ def _compute_residuals_v2(
             core_ents = cluster_to_core.get(cluster_id, set())
             covered_by_roles.update(core_ents)
 
-        total_covered = covered_by_roles | birthright_set
+        total_covered = covered_by_roles | birthright_set | tiered_ent_set
 
         if user_id in user_idx_map:
             u = user_idx_map[user_id]
@@ -637,7 +629,6 @@ def _compute_residuals_v2(
             residuals.append({"USR_ID": user_id, "entitlement_id": ent_id})
 
     # Users with NO cluster membership
-    # CHANGE 2026-02-17: Use user_ids parameter instead of matrix.index
     all_users = set(user_ids)
     assigned_users = set(user_memberships.keys())
 
@@ -648,7 +639,7 @@ def _compute_residuals_v2(
             user_ents = set(ent_ids_array[matrix.indices[start:end]])
         else:
             user_ents = set()
-        residual_ents = user_ents - birthright_set
+        residual_ents = user_ents - birthright_set - tiered_ent_set
 
         for ent_id in residual_ents:
             residuals.append({"USR_ID": user_id, "entitlement_id": ent_id})
@@ -717,7 +708,6 @@ def _build_summary(
 
     CHANGE 2026-02-17: Updated to work with sparse matrix.
     """
-    # CHANGE 2026-02-17: Use matrix.shape[0] instead of len(matrix)
     total_users = matrix.shape[0]
     assigned_users = len(user_memberships)
 

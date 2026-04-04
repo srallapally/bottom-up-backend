@@ -8,9 +8,14 @@ from scipy.sparse import csr_matrix
 
 _logger = logging.getLogger(__name__)
 
+# Columns that must be read as string to prevent pandas float inference.
+# Without this, APP_ID "1" becomes 1.0 and empty APP_ID becomes "nan",
+# producing namespaced_ids like "1.0:3148" or "nan:47" instead of "1:3148".
+_ID_DTYPES = {"USR_ID": str, "APP_ID": str, "ENT_ID": str}
+
 
 def parse_identities(filepath: str) -> pd.DataFrame:
-    df = pd.read_csv(filepath)
+    df = pd.read_csv(filepath, low_memory=False)
     df.columns = df.columns.str.strip()
     df["USR_ID"] = df["USR_ID"].astype(str).str.strip()
     df = df.set_index("USR_ID")
@@ -18,10 +23,10 @@ def parse_identities(filepath: str) -> pd.DataFrame:
 
 
 def parse_entitlements(filepath: str) -> pd.DataFrame:
-    df = pd.read_csv(filepath)
+    df = pd.read_csv(filepath, dtype=_ID_DTYPES)
     df.columns = df.columns.str.strip()
-    df["APP_ID"] = df["APP_ID"].astype(str).str.strip()
-    df["ENT_ID"] = df["ENT_ID"].astype(str).str.strip()
+    df["APP_ID"] = df["APP_ID"].str.strip()
+    df["ENT_ID"] = df["ENT_ID"].str.strip()
     df["namespaced_id"] = df["APP_ID"] + ":" + df["ENT_ID"]
     return df
 
@@ -38,14 +43,14 @@ def parse_assignments(filepath: str) -> pd.DataFrame:
          clean and the confidence scorer doesn't double-count grants.
     """
     _logger.info("parse_assignments: reading %s", filepath)
-    df = pd.read_csv(filepath)
+    df = pd.read_csv(filepath, dtype=_ID_DTYPES)
     df.columns = df.columns.str.strip()
     raw_count = len(df)
 
     # FIX 1: Strip before drop so whitespace-only IDs are caught.
     for col in ("USR_ID", "APP_ID", "ENT_ID"):
         if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().replace("", pd.NA)
+            df[col] = df[col].str.strip().replace("", pd.NA)
 
     df = df.dropna(subset=["USR_ID", "APP_ID", "ENT_ID"])
     after_drop = len(df)

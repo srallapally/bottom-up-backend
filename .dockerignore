@@ -19,3 +19,13 @@ data/
 logs/
 tmp/
 *.zip
+tests/
+.idea/
+.git/
+.gitignore
+.DS_Store
+build_call_graph.py
+set_gcp_vars.sh
+lifecycle.json
+worker.py
+sessions/

@@ -41,6 +41,7 @@ logging.basicConfig(
 def create_app():
     app = Flask(__name__)
 
+    load_dotenv()
     # Guardrail: reject oversized request bodies at the framework boundary.
     # Configure via env for GCP deployments.
     # Example: MAX_CONTENT_LENGTH_BYTES=52428800 (50MB)

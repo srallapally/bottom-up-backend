@@ -12,6 +12,10 @@ New endpoints for V2 hybrid approach:
 - POST /api/sessions/<id>/draft-roles/<id>/approve - Approve draft role
 
 V1 endpoints remain unchanged in routes/mining.py
+
+CHANGE 2026-04-02: Added Step 6.5 — hybrid co-occurrence mining on Leiden
+residuals. Discovers supplementary roles for unassigned users and merges
+them into the roles list before confidence scoring.
 """
 
 import json
@@ -20,6 +24,7 @@ import sys
 import logging
 from typing import Dict, Any
 
+import numpy as np
 from flask import Blueprint, request, jsonify, g
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,26 @@ def _ensure_owner(session_id: str):
     if owner != g.user["sub"]:
         return jsonify({"error": "Forbidden"}), 403
     return None
+
+
+def _sanitize_for_json(obj):
+    """
+    Recursively convert numpy types to native Python types so json.dumps
+    doesn't choke on numpy.int64 keys or numpy.float64 values.
+    """
+    if isinstance(obj, dict):
+        return {_sanitize_for_json(k): _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
 
 
 # Add parent directory to path for imports
@@ -60,22 +85,19 @@ from models.session import (
     sync_file,
     fetch_file,
 )
-from services.birthright import detect_birthright
+from services.birthright import detect_birthright, detect_tiered_birthrights
 from services.clustering import cluster_entitlements_leiden
 from services.role_builder import build_roles
 
-# CHANGE 2026-02-17: Import for sparse matrix loading
+# CHANGE 2026-04-02: Import hybrid miner
+from services.hybrid_miner import discover_hybrid_roles, merge_hybrid_into_cluster_result
+
 import scipy.sparse as sp
 import pandas as pd
 
 
 def load_sparse_matrix(session_id: str):
-    """
-    CHANGE 2026-02-17: Load sparse matrix from npz file with indices.
-
-    Returns:
-        tuple: (sparse_matrix, user_ids, ent_ids)
-    """
+    """Load sparse matrix from npz file with indices."""
     session_path = get_session_path(session_id)
     matrix_path = os.path.join(session_path, "processed", "matrix.npz")
     users_path = os.path.join(session_path, "processed", "matrix_users.csv")
@@ -112,12 +134,6 @@ mining_bp = Blueprint("mining", __name__)
 
 @require_auth
 def get_config_v2(session_id):
-    """
-    GET /api/sessions/<id>/config-v2
-
-    Returns V2 configuration for this session.
-    Falls back to V1 config if V2 doesn't exist, then to defaults.
-    """
     deny = _ensure_owner(session_id)
     if deny:
         return deny
@@ -136,14 +152,6 @@ def get_config_v2(session_id):
 
 @require_auth
 def save_config_v2(session_id):
-    """
-    PUT /api/sessions/<id>/config-v2
-
-    Save V2 configuration for this session.
-    Validates before saving.
-
-    Request body: Partial or full config dict (merged with defaults)
-    """
     deny = _ensure_owner(session_id)
     if deny:
         return deny
@@ -153,12 +161,10 @@ def save_config_v2(session_id):
     except FileNotFoundError:
         return jsonify({"error": "Session not found"}), 404
 
-    # Merge request body with defaults
     body = request.get_json(silent=True) or {}
     config_dict = merge_configs(DEFAULT_MINING_CONFIG, body)
     config = MiningConfig.from_dict(config_dict)
 
-    # Validate
     errors = config.validate()
     if errors:
         return jsonify({
@@ -166,7 +172,6 @@ def save_config_v2(session_id):
             "validation_errors": errors,
         }), 400
 
-    # Save
     save_session_config(session_path, config)
     sync_file(session_id, "config.json")
 
@@ -181,25 +186,6 @@ def save_config_v2(session_id):
 
 @require_auth
 def mine_v2(session_id):
-    """
-    POST /api/sessions/<id>/mine-v2
-
-    V2 hybrid role mining - bootstrap phase.
-
-    Workflow:
-    1. Load processed data (matrix, identities, catalog)
-    2. Merge config (defaults + request body overrides)
-    3. Validate config
-    4. Detect birthright entitlements (reuse V1)
-    5. Cluster entitlements using Leiden (V2)
-    6. Build draft roles from clusters (V2)
-    7. Score assignments (V2 - enhanced)
-    8. Generate recommendations (V1 logic)
-    9. Save results to results_v2/
-
-    Request body: Optional config overrides
-    Response: Draft roles for stakeholder review
-    """
     deny = _ensure_owner(session_id)
     if deny:
         return deny
@@ -209,31 +195,21 @@ def mine_v2(session_id):
     except FileNotFoundError:
         return jsonify({"error": "Session not found"}), 404
 
-    # Check processed data exists
-    # CHANGE 2026-02-17: Now checking for .npz file instead of .csv
     matrix_path = os.path.join(session_path, "processed", "matrix.npz")
     if not os.path.isfile(matrix_path):
         return jsonify({"error": "No processed data. Call /process first."}), 400
 
     execution_backend = os.getenv("EXECUTION_BACKEND", "local").strip().lower()
     if execution_backend in {"gcp", "cloud", "cloud_run", "cloud_run_jobs", "jobs"}:
-        # Trigger async mining via Cloud Run Jobs. Endpoint contract unchanged.
-        # IMPORTANT: Persist any request-body config overrides before triggering the job,
-        # so the worker reads the correct config.json.
         try:
-            # FIX 9: Read current status before firing a Cloud Run Job.
-            # Two rapid POSTs to /mine would otherwise launch duplicate jobs
-            # writing to the same GCS prefix.
-            from models.session import _gcp_session_doc  # module-private but same package
+            from models.session import _gcp_session_doc
             import json as _json
             _meta_path = os.path.join(session_path, "meta.json")
             _current_status = None
             try:
-                # GCP mode: prefer Firestore as the authoritative status source
                 _doc = _gcp_session_doc(session_id)
                 _current_status = (_doc or {}).get("status")
             except Exception:
-                # Fallback: local meta.json cache
                 try:
                     with open(_meta_path) as _f:
                         _current_status = _json.load(_f).get("status")
@@ -247,7 +223,6 @@ def mine_v2(session_id):
 
             request_body = request.get_json(silent=True) or {}
             if request_body:
-                # FIX 6 (GCP path): merge overrides on top of saved config, not defaults
                 _saved_config = load_session_config(session_path)
                 config_dict = merge_configs(_saved_config.to_dict(), request_body)
                 config = MiningConfig.from_dict(config_dict)
@@ -286,9 +261,6 @@ def mine_v2(session_id):
                 pass
             return jsonify({"error": str(e)}), 500
 
-
-    # FIX 8: Guard against repeated /mine calls on the local path.
-    # Read current status before starting; reject with 409 if already MINING.
     import json as _json
     _meta_path = os.path.join(session_path, "meta.json")
     try:
@@ -298,9 +270,8 @@ def mine_v2(session_id):
             logger.warning("mine_v2 rejected: session %s already MINING", session_id)
             return jsonify({"error": "Mining already in progress", "status": "MINING"}), 409
     except (FileNotFoundError, ValueError):
-        pass  # No meta yet or unreadable — proceed
+        pass
 
-    # Initialize V2 directories
     initialize_session_directories(session_path)
 
     import time as _time
@@ -310,7 +281,6 @@ def mine_v2(session_id):
     # Step 1: Load data
     _t = _time.monotonic()
     logger.info("Step 1: Loading processed data")
-    # CHANGE 2026-02-17: Load sparse matrix + indices instead of dense DataFrame
     matrix, user_ids, ent_ids = load_sparse_matrix(session_id)
     identities = load_dataframe(session_id, "processed/identities.csv")
 
@@ -326,8 +296,6 @@ def mine_v2(session_id):
     )
 
     # Step 2: Load saved config, then apply any request-body overrides on top.
-    # FIX 6: previously merged DEFAULT_MINING_CONFIG + request body, discarding
-    # any config.json saved by PUT /config. Now loads config.json first.
     _t = _time.monotonic()
     logger.info("Step 2: Loading configuration")
     fetch_file(session_id, "config.json")
@@ -351,8 +319,6 @@ def mine_v2(session_id):
             "validation_errors": validation_errors,
         }), 400
 
-    # Validate that configured user_attributes columns exist in identities.csv.
-    # Hard fail if any column is missing — customer must fix config before mining.
     data_validation_errors = config.validate_against_data(
         identities_columns=list(identities.columns)
     )
@@ -362,14 +328,11 @@ def mine_v2(session_id):
             "validation_errors": data_validation_errors,
         }), 400
 
-    # Save config for reproducibility
     save_session_config(session_path, config)
     sync_file(session_id, "config.json")
     logger.info("Step 3 done: elapsed_ms=%.0f", (_time.monotonic() - _t) * 1000)
 
     # Flatten per-app birthright dict to namespaced list
-    # FIX 7: renamed loop var from ent_ids to ent_list to avoid shadowing the
-    # sparse matrix ent_ids array loaded in Step 1.
     birthright_explicit_flat = []
     for app_name, ent_list in config.birthright_explicit.items():
         for eid in ent_list:
@@ -394,13 +357,56 @@ def mine_v2(session_id):
         (_time.monotonic() - _t) * 1000,
     )
 
+    # Step 4.5: Tiered birthright detection (sub-population birthrights)
+    tiered_result = None
+    if config.tiered_birthright_enabled:
+        _t = _time.monotonic()
+        logger.info("Step 4.5: Tiered birthright detection")
+
+        attr_columns = config.get_attribute_columns() if hasattr(config, 'get_attribute_columns') else []
+        if not attr_columns:
+            logger.info(
+                "Step 4.5: skipping tiered birthright detection — "
+                "user_attributes not configured. Configure via PUT /config to enable."
+            )
+        else:
+            tiered_result = detect_tiered_birthrights(
+                matrix=birthright_result["filtered_matrix"],
+                user_ids=user_ids,
+                ent_ids=birthright_result["filtered_ent_ids"],
+                identities=identities,
+                user_attributes=config.user_attributes,
+                threshold=config.tiered_birthright_threshold,
+                min_subpop_size=config.tiered_birthright_min_subpop_size,
+            )
+            logger.info(
+                "Step 4.5 done: tiered_roles=%d pairs_absorbed=%d elapsed_ms=%.0f",
+                len(tiered_result["tiered_birthright_roles"]),
+                tiered_result["tiered_stats"]["total_assignment_pairs_absorbed"],
+                (_time.monotonic() - _t) * 1000,
+            )
+    else:
+        logger.info("Step 4.5: tiered birthright detection disabled")
+
     # Step 5: Entitlement clustering (V2 - Leiden)
     _t = _time.monotonic()
     logger.info("Step 5: Running Leiden clustering")
+
+    clustering_matrix = (
+        tiered_result["filtered_matrix"]
+        if tiered_result
+        else birthright_result["filtered_matrix"]
+    )
+    clustering_ent_ids = (
+        tiered_result["filtered_ent_ids"]
+        if tiered_result
+        else birthright_result["filtered_ent_ids"]
+    )
+
     try:
         cluster_result = cluster_entitlements_leiden(
-            matrix=birthright_result["filtered_matrix"],
-            ent_ids=birthright_result["filtered_ent_ids"],
+            matrix=clustering_matrix,
+            ent_ids=clustering_ent_ids,
             user_ids=user_ids,
             leiden_min_similarity=config.leiden_min_similarity,
             leiden_min_shared_users=config.leiden_min_shared_users,
@@ -433,6 +439,9 @@ def mine_v2(session_id):
         cluster_result=cluster_result,
         birthright_result=birthright_result,
         config=config.to_dict(),
+        tiered_birthright_roles=(
+            tiered_result["tiered_birthright_roles"] if tiered_result else []
+        ),
     )
     logger.info(
         "Step 6 done: roles=%d residuals=%d  elapsed_ms=%.0f",
@@ -450,10 +459,90 @@ def mine_v2(session_id):
     birthright_promotions = roles_result.get("birthright_promotions", [])
     merge_candidates = roles_result.get("merge_candidates", [])
 
+    # ---- Step 6.5: Hybrid co-occurrence mining on residuals ----
+    # CHANGE 2026-04-02: Discover supplementary roles from Leiden residuals
+    _t = _time.monotonic()
+    logger.info("Step 6.5: Hybrid co-occurrence mining on residuals")
+    hybrid_result = discover_hybrid_roles(
+        matrix=matrix,
+        user_ids=user_ids,
+        ent_ids=ent_ids,
+        leiden_roles=draft_roles,
+        user_memberships=cluster_result["user_cluster_membership"],
+        birthright_entitlements=birthright_result["birthright_entitlements"],
+        tiered_birthright_roles=(
+            tiered_result["tiered_birthright_roles"] if tiered_result else []
+        ),
+        min_co_occurrence=config.leiden_min_shared_users * 8,  # scale with config
+        min_co_occurrence_growth=getattr(config, 'min_co_occurrence_growth', 10),
+        min_role_users=config.min_role_size,
+        min_entitlements_per_role=config.min_entitlements_per_role,
+    )
+    hybrid_roles = hybrid_result["hybrid_roles"]
+    hybrid_stats = hybrid_result["hybrid_stats"]
+
+    if hybrid_roles:
+        # Merge hybrid roles into cluster_result so confidence scorer can find them
+        cluster_result = merge_hybrid_into_cluster_result(cluster_result, hybrid_roles)
+        # Append hybrid roles to draft_roles list
+        draft_roles = draft_roles + hybrid_roles
+        logger.info(
+            "Step 6.5 done: %d hybrid roles, %d users covered, elapsed_ms=%.0f",
+            len(hybrid_roles), hybrid_stats["hybrid_users_covered"],
+            (_time.monotonic() - _t) * 1000,
+        )
+    else:
+        logger.info("Step 6.5 done: no hybrid roles discovered, elapsed_ms=%.0f",
+                     (_time.monotonic() - _t) * 1000)
+
+    # ---- Diagnostic: unassigned user entitlement distribution ----
+    _t_diag = _time.monotonic()
+    try:
+        assigned_user_set = set(cluster_result["user_cluster_membership"].keys())
+        user_id_to_idx = {uid: i for i, uid in enumerate(user_ids)}
+        unassigned_indices = np.array([
+            user_id_to_idx[uid] for uid in user_ids
+            if str(uid) not in assigned_user_set and uid not in assigned_user_set
+        ])
+        if len(unassigned_indices) > 0:
+            unassigned_sub = clustering_matrix[unassigned_indices]
+            epts = np.diff(unassigned_sub.indptr)
+            logger.info(
+                "DIAGNOSTIC — unassigned user ent distribution (post-BR/tiered removal): "
+                "n=%d mean=%.1f median=%.1f p25=%.0f p75=%.0f p90=%.0f max=%d "
+                "zero=%d one_to_three=%d four_to_ten=%d ten_plus=%d",
+                len(epts), epts.mean(), np.median(epts),
+                np.percentile(epts, 25), np.percentile(epts, 75),
+                np.percentile(epts, 90), epts.max(),
+                int((epts == 0).sum()),
+                int(((epts >= 1) & (epts <= 3)).sum()),
+                int(((epts >= 4) & (epts <= 10)).sum()),
+                int((epts > 10).sum()),
+            )
+        else:
+            logger.info("DIAGNOSTIC — no unassigned users (all assigned to clusters)")
+    except Exception as _diag_err:
+        logger.warning("DIAGNOSTIC failed: %s", _diag_err, exc_info=True)
+    logger.info("DIAGNOSTIC elapsed_ms=%.0f", (_time.monotonic() - _t_diag) * 1000)
+
+    # Update summary with hybrid stats
+    summary_base["hybrid_roles"] = len(hybrid_roles)
+    summary_base["hybrid_users_covered"] = hybrid_stats.get("hybrid_users_covered", 0)
+    summary_base["total_roles"] = len(draft_roles)
+    summary_base["assigned_users"] = len(cluster_result["user_cluster_membership"])
+    summary_base["unassigned_users"] = matrix.shape[0] - summary_base["assigned_users"]
+
     # Step 7: Build results structure
     results = {
         "roles": draft_roles,
         "birthright_role": birthright_role,
+        "tiered_birthright_roles": (
+            tiered_result["tiered_birthright_roles"] if tiered_result else []
+        ),
+        "tiered_birthright_stats": (
+            tiered_result["tiered_stats"] if tiered_result else {}
+        ),
+        "hybrid_stats": hybrid_stats,
         "birthright_promotions": birthright_promotions,
         "merge_candidates": merge_candidates,
         "residuals": residuals,
@@ -466,13 +555,10 @@ def mine_v2(session_id):
         "multi_cluster_info": multi_cluster_info,
         "naming_summary": naming_summary,
         "config": config.to_dict(),
-        "status": "draft",  # Not yet approved by stakeholders
+        "status": "draft",
     }
 
     # Step 8: Confidence Scoring (V2 - Multi-factor)
-    # FIX 3 wire-in: check user_attributes are configured before attempting scoring.
-    # validate_for_confidence_scoring() enforces the 2-5 count rule that was moved
-    # out of validate() so that mining itself is never blocked.
     _t = _time.monotonic()
     logger.info("Step 8: Computing multi-factor confidence scores")
     _scoring_config_errors = config.validate_for_confidence_scoring()
@@ -487,7 +573,6 @@ def mine_v2(session_id):
             "message": "Configure user_attributes via PUT /config to enable confidence scoring",
         }
     else:
-        # Load assignments
         assignments_path = os.path.join(session_path, "processed", "assignments.csv")
         if not os.path.isfile(assignments_path):
             logger.warning("Step 8: assignments.csv not found, skipping confidence scoring")
@@ -498,8 +583,9 @@ def mine_v2(session_id):
                 "reason": "confidence_scorer module not installed",
             }
 
-    # Scoring block — only runs when user_attributes valid and scorer available
-    if os.path.isfile(os.path.join(session_path, "processed", "assignments.csv"))             and CONFIDENCE_SCORER_V2_AVAILABLE             and not _scoring_config_errors:
+    if os.path.isfile(os.path.join(session_path, "processed", "assignments.csv")) \
+            and CONFIDENCE_SCORER_V2_AVAILABLE \
+            and not _scoring_config_errors:
         assignments_path = os.path.join(session_path, "processed", "assignments.csv")
         assignments_df = load_dataframe(session_id, "processed/assignments.csv").reset_index(drop=True)
 
@@ -508,7 +594,6 @@ def mine_v2(session_id):
                 from services.confidence_scorer import SparseMatrixAccessor
                 matrix_for_scoring = SparseMatrixAccessor(matrix, user_ids, ent_ids)
 
-                # Score all assignments with V2 multi-factor confidence
                 enriched_assignments = score_assignments(
                     assignments_df=assignments_df,
                     full_matrix=matrix_for_scoring,
@@ -517,35 +602,31 @@ def mine_v2(session_id):
                     roles=draft_roles,
                     birthright_entitlements=birthright_result["birthright_entitlements"],
                     noise_entitlements=birthright_result.get("noise_entitlements", []),
+                    tiered_birthright_roles=(
+                        tiered_result["tiered_birthright_roles"] if tiered_result else []
+                    ),
                     config=config.to_dict(),
-                    drift_data=None,  # TODO: Load from daily clustering when available
+                    drift_data=None,
                 )
 
-                # Save enriched assignments
-                # enriched_assignments.to_csv(assignments_path, index=False)
                 results_path = get_results_path(session_path)
                 enriched_assignments.to_csv(
                     os.path.join(results_path, "assignments_scored.csv"),
                     index=False
                 )
-                # Generate recommendations (missing entitlements with high confidence)
-                # TODO: Implement recommendations_v2 properly
+
                 recommendations = generate_recommendations(
                     enriched_assignments=enriched_assignments,
-                    # CHANGE 2026-02-17: Pass SparseMatrixAccessor for sparse-safe lookups
-                    # (avoids accidental densification inside recommendation logic)
                     full_matrix=matrix_for_scoring,
                     cluster_result=cluster_result,
                     config=config.to_dict(),
                 )
 
-                # Detect over-provisioned access (low confidence)
                 over_provisioned = detect_over_provisioned(
                     enriched_assignments=enriched_assignments,
                     revocation_threshold=config.revocation_threshold,
                 )
 
-                # Save scoring outputs to results_v2/
                 recommendations.to_csv(
                     os.path.join(results_path, "recommendations.csv"),
                     index=False
@@ -555,14 +636,12 @@ def mine_v2(session_id):
                     index=False
                 )
 
-                # Build scoring summary
                 scoring_summary = build_scoring_summary(
                     enriched_assignments=enriched_assignments,
                     cluster_result=cluster_result,
                     birthright_entitlements=birthright_result["birthright_entitlements"],
                 )
 
-                # Add to results
                 results.update(scoring_summary)
 
                 logger.info(
@@ -574,7 +653,6 @@ def mine_v2(session_id):
 
             except Exception as e:
                 logger.error(f"Confidence scoring failed: {e}", exc_info=True)
-                # Continue without scoring
                 results["confidence_scoring"] = {
                     "error": str(e),
                     "message": "Confidence scoring failed, results available without scoring"
@@ -589,15 +667,16 @@ def mine_v2(session_id):
     # Step 9: Save results
     _t = _time.monotonic()
     logger.info("Step 9: Saving results")
+
+    results = _sanitize_for_json(results)
+
     save_json(session_id, "results/draft_results.json", results)
 
-    # Patch stats.json with role count so the dashboard can display it
-    # fetch_file ensures we have the latest copy from GCS (cache may be stale)
     try:
         logger.info("Step 9: Patching stats.json")
         fetch_file(session_id, "processed/stats.json")
     except Exception:
-        pass  # file may not exist yet; isfile check below handles it
+        pass
     _stats_path = os.path.join(session_path, "processed", "stats.json")
     if os.path.isfile(_stats_path):
         try:
@@ -609,8 +688,7 @@ def mine_v2(session_id):
             sync_file(session_id, "processed/stats.json")
         except Exception as _e:
             logger.warning("Failed to patch stats.json with roles_discovered: %s", _e, exc_info=True)
-    # Save cluster membership before sync so it is included in the GCS upload.
-    # (Previously this was after sync_session_tree, so it was never persisted to GCS.)
+
     save_json(
         session_id,
         "results/cluster_membership.json",
@@ -622,10 +700,12 @@ def mine_v2(session_id):
         "Step 9 done: elapsed_ms=%.0f", (_time.monotonic() - _t) * 1000
     )
     logger.info(
-        "mine_v2 complete: session=%s total_elapsed_ms=%.0f roles=%d",
+        "mine_v2 complete: session=%s total_elapsed_ms=%.0f roles=%d (leiden=%d hybrid=%d)",
         session_id,
         (_time.monotonic() - _mine_start) * 1000,
         len(results.get("roles", [])),
+        len(roles_result.get("roles", [])),
+        len(hybrid_roles),
     )
     return jsonify(results), 200
 
@@ -638,11 +718,6 @@ def mine_v2(session_id):
 
 @require_auth
 def get_draft_roles(session_id):
-    """
-    GET /api/sessions/<id>/draft-roles
-
-    Returns draft roles for stakeholder review.
-    """
     deny = _ensure_owner(session_id)
     if deny:
         return deny
@@ -668,22 +743,6 @@ def get_draft_roles(session_id):
 
 @require_auth
 def approve_draft_role(session_id, role_id):
-    """
-    POST /api/sessions/<id>/draft-roles/<role_id>/approve
-
-    Approve a draft role (converts to business role).
-
-    Request body:
-    {
-        "role_name": "Cloud Infrastructure Engineer",  // Optional override
-        "owner": "CTO",                                // Required
-        "purpose": "Manage cloud infrastructure",      // Optional
-        "entitlements": ["AWS:S3", "AWS:EC2"],        // Optional override
-    }
-
-    TODO: Implement business role versioning and storage
-    For now, just acknowledges the approval.
-    """
     deny = _ensure_owner(session_id)
     if deny:
         return deny
@@ -698,7 +757,6 @@ def approve_draft_role(session_id, role_id):
     except FileNotFoundError:
         return jsonify({"error": "No draft roles. Run /mine first."}), 404
 
-    # Find the role
     role = None
     for r in draft_results["roles"]:
         if r["role_id"] == role_id:
@@ -708,14 +766,11 @@ def approve_draft_role(session_id, role_id):
     if not role:
         return jsonify({"error": f"Role {role_id} not found"}), 404
 
-    # Get approval details from request
     body = request.get_json(silent=True) or {}
 
-    # Validate required fields
     if "owner" not in body:
         return jsonify({"error": "Field 'owner' is required"}), 400
 
-    # Build business role
     business_role = {
         "role_id": role_id,
         "role_name": body.get("role_name", role.get("role_name", role_id)),
@@ -731,7 +786,6 @@ def approve_draft_role(session_id, role_id):
         "approved_at": _get_current_timestamp(),
     }
 
-    # Save to business_roles/
     business_roles_dir = os.path.join(session_path, "business_roles")
     os.makedirs(business_roles_dir, exist_ok=True)
 
@@ -755,11 +809,6 @@ def approve_draft_role(session_id, role_id):
 
 @require_auth
 def get_results_v2(session_id):
-    """
-    GET /api/sessions/<id>/results-v2
-
-    Returns V2 mining results.
-    """
     deny = _ensure_owner(session_id)
     if deny:
         return deny
@@ -780,19 +829,12 @@ def get_results_v2(session_id):
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
-# CHANGED: Removed _build_draft_roles_from_clusters, _generate_role_name,
-# _summarize_hr_attributes, _build_birthright_role.
-# These were duplicates of logic now in services/role_builder.py.
-# The mine_v2 route calls build_roles() which handles all role construction,
-# naming (ROLE_NNN), HR summary (from config user_attributes), and birthright.
-
 
 def _build_summary(cluster_result: dict, birthright_result: dict, matrix) -> dict:
     """Build summary statistics."""
     n_clusters = cluster_result["n_clusters"]
     user_memberships = cluster_result["user_cluster_membership"]
 
-    # Multi-cluster statistics
     multi_cluster_count = sum(
         1 for memberships in user_memberships.values()
         if len(memberships) > 1

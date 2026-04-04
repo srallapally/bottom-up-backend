@@ -91,6 +91,17 @@ VALIDATION_RULES = {
         "max": 0.3,
         "error_high": "Auto-approve threshold > 0.3 too risky",
     },
+    # ADDED 2026-04-02: Tiered birthright validation rules
+    "tiered_birthright_threshold": {
+        "min": 0.5,
+        "max": 1.0,
+        "error_low": "Tiered birthright threshold < 0.5 extracts non-baseline entitlements",
+        "error_high": "Tiered birthright threshold cannot exceed 1.0",
+    },
+    "tiered_birthright_min_subpop_size": {
+        "min": 10,
+        "error": "Minimum sub-population size must be >= 10",
+    },
 }
 
 
@@ -108,6 +119,11 @@ DEFAULT_MINING_CONFIG: Dict[str, Any] = {
         # Example: {"ActiveDirectory": ["User"], "Email": ["Access"]}
     },
     "min_assignment_count": 5,  # Filter out entitlements with < 5 assignments
+
+    # ADDED 2026-04-02: Tiered birthright detection (sub-population birthrights)
+    "tiered_birthright_enabled": True,
+    "tiered_birthright_threshold": 0.80,
+    "tiered_birthright_min_subpop_size": 50,
 
     # =========================================================================
     # ENTITLEMENT CLUSTERING (Leiden-based, V2)
@@ -296,6 +312,11 @@ class MiningConfig:
     birthright_explicit: Dict[str, List[str]] = field(default_factory=dict)
     min_assignment_count: int = 5
 
+    # ADDED 2026-04-02: Tiered birthright
+    tiered_birthright_enabled: bool = True
+    tiered_birthright_threshold: float = 0.80
+    tiered_birthright_min_subpop_size: int = 50
+
     # Leiden clustering
     entitlement_clustering_method: str = "leiden"
     leiden_min_similarity: float = 0.3
@@ -309,8 +330,6 @@ class MiningConfig:
     min_entitlements_per_role: int = 2
 
     # Business role management
-    # CHANGED: removed auto_generate_role_names, role_name_primary_attr,
-    # role_name_secondary_attr, role_name_min_dominance
     allow_draft_role_editing: bool = True
     require_role_owner: bool = True
     require_role_purpose: bool = False
@@ -341,8 +360,6 @@ class MiningConfig:
     notify_on_drift_alert: bool = True
 
     # Confidence scoring
-    # CHANGED: removed use_attribute_weighting, attribute_weights, attribute_columns
-    # ADDED: user_attributes, prevalence thresholds
     user_attributes: List[Dict[str, Any]] = field(default_factory=list)
     entitlement_prevalence_threshold: float = 0.75
     entitlement_association_threshold: float = 0.40
@@ -432,13 +449,10 @@ class MiningConfig:
             errors.append(f"min_entitlement_coverage > {rule['max']}: {rule['error_high']}")
 
         # FIX 3: user_attributes count check moved to validate_for_confidence_scoring().
-        # Only structural correctness is enforced here so POST /mine is never blocked
-        # by an empty user_attributes list.
         rule = VALIDATION_RULES["user_attributes"]
         if not isinstance(self.user_attributes, list):
             errors.append("user_attributes must be a list")
         elif len(self.user_attributes) > 0:
-            # Validate structure only when entries are present.
             columns_seen = set()
             has_any_weight = any("weight" in attr for attr in self.user_attributes)
             has_all_weights = all("weight" in attr for attr in self.user_attributes)
@@ -457,7 +471,6 @@ class MiningConfig:
                     errors.append(f"user_attributes[{i}]: duplicate column '{col}': {rule['error_duplicate']}")
                 columns_seen.add(col)
 
-            # Weight validation: either all have weights or none do
             if has_any_weight and not has_all_weights:
                 errors.append("user_attributes: if any entry has a weight, all must have a weight")
             elif has_all_weights:
@@ -524,6 +537,19 @@ class MiningConfig:
         if self.drift_auto_approve_threshold > rule["max"]:
             errors.append(f"drift_auto_approve_threshold > {rule['max']}: {rule['error_high']}")
 
+        # ADDED 2026-04-02: Tiered birthright validation
+        rule = VALIDATION_RULES.get("tiered_birthright_threshold", {})
+        if rule:
+            if self.tiered_birthright_threshold < rule.get("min", 0.5):
+                errors.append(f"tiered_birthright_threshold < {rule['min']}: {rule['error_low']}")
+            if self.tiered_birthright_threshold > rule.get("max", 1.0):
+                errors.append(f"tiered_birthright_threshold > {rule['max']}: {rule['error_high']}")
+
+        rule = VALIDATION_RULES.get("tiered_birthright_min_subpop_size", {})
+        if rule:
+            if self.tiered_birthright_min_subpop_size < rule.get("min", 10):
+                errors.append(f"tiered_birthright_min_subpop_size < {rule['min']}: {rule['error']}")
+
         return errors
 
     def validate_for_confidence_scoring(self) -> List[str]:
@@ -531,8 +557,6 @@ class MiningConfig:
         FIX 3: Additional validation required when user_attributes are used for
         confidence scoring. Called separately from validate() so mining is not
         blocked by an empty user_attributes list.
-
-        Call this in mine_v2 before the confidence scoring step, not before mining.
         """
         errors = []
         rule = VALIDATION_RULES["user_attributes"]
@@ -547,23 +571,12 @@ class MiningConfig:
     def validate_against_data(self, identities_columns: List[str]) -> List[str]:
         """
         ADDED: Validate that user_attributes columns exist in actual data.
-
-        Called at mining time after file upload, not at config time.
-        Hard fail if any configured attribute column is missing from identities.csv.
-
-        Args:
-            identities_columns: List of column names from identities.csv
-
-        Returns:
-            List of error messages (empty if valid)
         """
         errors = []
 
-        # USR_ID is mandatory
         if "USR_ID" not in identities_columns:
             errors.append("identities.csv must contain 'USR_ID' column")
 
-        # Every configured attribute column must exist
         for attr in self.user_attributes:
             col = attr.get("column", "")
             if col not in identities_columns:
@@ -575,20 +588,11 @@ class MiningConfig:
         return errors
 
     def get_attribute_columns(self) -> List[str]:
-        """
-        ADDED: Get list of configured attribute column names.
-
-        Convenience method used by role_builder and confidence_scorer.
-        """
+        """Get list of configured attribute column names."""
         return [attr["column"] for attr in self.user_attributes]
 
     def get_attribute_weights(self) -> Dict[str, float]:
-        """
-        ADDED: Get column->weight mapping. Auto-assigns equal weights if not specified.
-
-        Returns:
-            Dict mapping column name to weight, guaranteed to sum to 1.0.
-        """
+        """Get column->weight mapping. Auto-assigns equal weights if not specified."""
         n = len(self.user_attributes)
         if n == 0:
             return {}
@@ -644,27 +648,24 @@ def merge_configs(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, 
 # CONFIGURATION PRESETS
 # ============================================================================
 
-# Conservative preset (fewer, larger roles)
 CONSERVATIVE_CONFIG = {
-    "leiden_min_similarity": 0.4,  # Higher = fewer edges
-    "leiden_resolution": 0.8,  # Lower = larger clusters
-    "min_entitlement_coverage": 0.6,  # Higher coverage required
-    "max_clusters_per_user": 3,  # Limit multi-membership
-    "drift_auto_approve_threshold": 0.05,  # Very low drift only
-    "drift_auto_approve_min_prevalence": 0.8,  # 80%+ prevalence required
+    "leiden_min_similarity": 0.4,
+    "leiden_resolution": 0.8,
+    "min_entitlement_coverage": 0.6,
+    "max_clusters_per_user": 3,
+    "drift_auto_approve_threshold": 0.05,
+    "drift_auto_approve_min_prevalence": 0.8,
 }
 
-# Aggressive preset (more, smaller roles)
 AGGRESSIVE_CONFIG = {
-    "leiden_min_similarity": 0.25,  # Lower = more edges
-    "leiden_resolution": 0.8,  # Higher = smaller clusters
-    "min_entitlement_coverage": 0.4,  # Lower coverage accepted
-    "max_clusters_per_user": 7,  # Allow more multi-membership
-    "drift_auto_approve_threshold": 0.15,  # Higher drift auto-approved
-    "drift_auto_approve_min_prevalence": 0.6,  # 60%+ prevalence sufficient
+    "leiden_min_similarity": 0.25,
+    "leiden_resolution": 0.8,
+    "min_entitlement_coverage": 0.4,
+    "max_clusters_per_user": 7,
+    "drift_auto_approve_threshold": 0.15,
+    "drift_auto_approve_min_prevalence": 0.6,
 }
 
-# Experimental preset (daily reclustering disabled, manual governance)
 MANUAL_GOVERNANCE_CONFIG = {
     "enable_daily_clustering": False,
     "enable_drift_detection": False,
@@ -674,15 +675,6 @@ MANUAL_GOVERNANCE_CONFIG = {
 
 
 def get_preset_config(preset: str) -> Dict[str, Any]:
-    """
-    Get configuration preset.
-
-    Args:
-        preset: "default", "conservative", "aggressive", or "manual"
-
-    Returns:
-        Configuration dictionary
-    """
     if preset == "conservative":
         return merge_configs(DEFAULT_MINING_CONFIG, CONSERVATIVE_CONFIG)
     elif preset == "aggressive":
@@ -694,78 +686,31 @@ def get_preset_config(preset: str) -> Dict[str, Any]:
 
 
 # ============================================================================
-# SESSION-BASED FILE I/O (integrates with existing session.py)
+# SESSION-BASED FILE I/O
 # ============================================================================
 
 def load_session_config(session_path: str) -> MiningConfig:
-    """
-    Load V2 configuration from session directory.
-
-    Looks for config_v2.json, falls back to config.json, falls back to defaults.
-
-    Args:
-        session_path: Path to session directory (e.g., data/sessions/<session_id>)
-
-    Returns:
-        MiningConfigV2 instance
-    """
-    # Try V2-specific config first
     config_path = os.path.join(session_path, "config.json")
     if os.path.isfile(config_path):
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
         return MiningConfig.from_dict(config_dict)
-
-    # No config found, use defaults
     return get_default_config()
 
 
 def save_session_config(session_path: str, config: MiningConfig) -> None:
-    """
-    Save V2 configuration to session directory.
-
-    Saves to config_v2.json (separate from V1 config.json).
-
-    Args:
-        session_path: Path to session directory
-        config: Configuration to save
-    """
     config_path = os.path.join(session_path, "config.json")
     with open(config_path, 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
 
 
 def get_results_path(session_path: str) -> str:
-    """
-    Get path to V2 results directory.
-
-    V2 results stored separately: results_v2/
-    V1 results remain in: results/
-
-    Args:
-        session_path: Path to session directory
-
-    Returns:
-        Path to results_v2 directory (creates if needed)
-    """
     results_path = os.path.join(session_path, "results")
     os.makedirs(results_path, exist_ok=True)
     return results_path
 
 
 def initialize_session_directories(session_path: str) -> None:
-    """
-    Create V2-specific directories in session.
-
-    Creates:
-        - results_v2/          (V2 mining results)
-        - business_roles/      (approved business roles, versioned)
-        - peer_clusters/       (daily peer cluster snapshots, last 90 days)
-        - drift_reports/       (daily drift detection reports)
-
-    Args:
-        session_path: Path to session directory
-    """
     os.makedirs(os.path.join(session_path, "results"), exist_ok=True)
     os.makedirs(os.path.join(session_path, "business_roles"), exist_ok=True)
     os.makedirs(os.path.join(session_path, "peer_clusters"), exist_ok=True)
@@ -777,7 +722,6 @@ def initialize_session_directories(session_path: str) -> None:
 # ============================================================================
 
 if __name__ == "__main__":
-    # Example 1: Use default config
     config = get_default_config()
     errors = config.validate()
     if errors:
@@ -787,24 +731,16 @@ if __name__ == "__main__":
     else:
         print("Configuration valid ✓")
 
-    # Example 2: Session-based I/O (simulated)
-    # session_path = "data/sessions/abc-123"
-    # config = load_session_config_v2(session_path)
-    # save_session_config_v2(session_path, config)
-
-    # Example 3: Use preset
     conservative = MiningConfig.from_dict(get_preset_config("conservative"))
     print(f"\nConservative preset:")
     print(f"  - min_similarity: {conservative.leiden_min_similarity}")
     print(f"  - resolution: {conservative.leiden_resolution}")
     print(f"  - coverage: {conservative.min_entitlement_coverage}")
 
-    # Example 4: Override specific values
     custom_config = get_default_config()
     custom_config.leiden_resolution = 1.2
     custom_config.max_clusters_per_user = 4
 
-    # Example 5: Validate before use
     errors = custom_config.validate()
     if not errors:
         print("\n✓ Custom config valid")

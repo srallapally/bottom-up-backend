@@ -183,10 +183,35 @@ def _read_json(path: str) -> dict:
         return {}
 
 
+def _sanitize_for_json(obj):
+    """Recursively convert numpy types to native Python types.
+
+    Handles both dict keys and values — json.JSONEncoder.default() only
+    covers values, not keys, so a custom encoder alone is insufficient.
+    """
+    import numpy as np
+
+    if isinstance(obj, dict):
+        return {_sanitize_for_json(k): _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
 def _write_json(path: str, data: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(_sanitize_for_json(data), f, indent=2)
 
 
 def create_session(owner: dict) -> str:
@@ -439,4 +464,4 @@ def load_dataframe(session_id: str, filename: str) -> pd.DataFrame:
     filepath = os.path.join(session_path, filename)
     if "matrix.csv" in filename:
         return pd.read_csv(filepath, index_col=0)
-    return pd.read_csv(filepath)
+    return pd.read_csv(filepath, low_memory=False)

@@ -11,3 +11,4 @@ data/sessions/
 .idea/
 *.egg-info/
 .env
+tests/
