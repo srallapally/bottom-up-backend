@@ -109,7 +109,6 @@ def load_sparse_matrix(session_id: str):
 
     return matrix_sparse, user_ids, ent_ids
 
-
 try:
     from services.confidence_scorer import (
         score_assignments,
@@ -121,6 +120,11 @@ try:
 
     CONFIDENCE_SCORER_V2_AVAILABLE = True
 except ImportError:
+    score_assignments = None
+    generate_recommendations = None
+    detect_over_provisioned = None
+    build_scoring_summary = None
+    save_cluster_assignments = None
     CONFIDENCE_SCORER_V2_AVAILABLE = False
 
 mining_bp = Blueprint("mining", __name__)

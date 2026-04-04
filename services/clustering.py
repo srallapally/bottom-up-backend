@@ -18,7 +18,11 @@ Algorithm:
 3. Run Leiden community detection to find entitlement clusters
 4. Assign users to clusters based on coverage threshold
 5. Drop small clusters (<min_role_size users)
-6. Support both full clustering and incremental updates
+
+Current implementation note:
+- Full clustering is implemented
+- Incremental clustering is NOT implemented yet
+- cluster_entitlements_incremental() currently falls back to full re-clustering
 """
 
 import numpy as np
@@ -271,13 +275,15 @@ def cluster_entitlements_incremental(
         config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Incremental clustering update (for daily reclustering).
+     Placeholder for future incremental clustering support.
 
-    Only re-clusters if data change exceeds threshold, otherwise updates existing.
+    Current behavior:
+        - incremental change detection is not implemented
+        - incremental cluster update logic is not implemented
+        - this function always returns a full re-clustering result
 
-    NOTE:
-        Incremental clustering is not implemented yet. This function currently
-        falls back to full re-clustering.
+    This function exists only to preserve the intended interface for a future
+    incremental implementation.
 
     Args:
         matrix: Current user × entitlement matrix (csr_matrix)
@@ -792,15 +798,12 @@ def _compute_data_change_magnitude(
         previous_result: Dict[str, Any],
 ) -> float:
     """
-    Compute magnitude of data change since last clustering.
+   Update clusters incrementally (optimization for daily updates).
 
-    Returns:
-        Float in [0, 1] representing % change
+    TODO: Implement incremental update logic.
+    For now, raises NotImplementedError to fall back to full clustering.
     """
-    # TODO: Implement proper change detection
-    # For now, return 1.0 (always do full clustering)
-    return 1.0
-
+    raise NotImplementedError("Incremental clustering not yet implemented")
 
 def _update_clusters_incrementally(
         matrix: csr_matrix,

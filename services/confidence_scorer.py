@@ -3,11 +3,14 @@
 Confidence Scorer V2 - Multi-Factor Confidence Scoring
 ======================================================
 
-Enhanced confidence scoring combining multiple signals:
+Enhanced confidence scoring combining currently implemented signals:
 1. Peer group prevalence (from entitlement clusters)
 2. Customer-configured user attribute alignment (flexible schema)
-3. Drift stability (how stable has this entitlement been over time)
-4. Role coverage (what % of user's assigned roles does user have)
+3. Role coverage (what % of user's assigned roles does user have)
+
+Planned but not implemented in the current release:
+4. Drift stability (placeholder only; not currently used as a real signal)
+5. Recommendation generation (placeholder only)
 
 CHANGE 2026-04-02: Added tiered_birthright_roles support for sub-population
 birthright scoring.
@@ -744,7 +747,17 @@ def _build_justification(confidence, available_scores, row):
 # ============================================================================
 
 def generate_recommendations(enriched_assignments, full_matrix, cluster_result, config):
-    return pd.DataFrame()
+    r"""
+    Placeholder for future access recommendation generation.
+
+    Current behavior:
+        returns an empty DataFrame with a stable schema marker so callers can
+        distinguish 'not implemented' from 'implemented but no recommendations'.
+    """
+    return pd.DataFrame(columns=["status", "message"]).assign(
+        status=["not_implemented"],
+        message=["Recommendation generation is not implemented in the current release"],
+    )
 
 def detect_over_provisioned(enriched_assignments, revocation_threshold):
     mask = enriched_assignments["confidence"] < revocation_threshold
