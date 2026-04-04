@@ -606,6 +606,11 @@ def _compute_weighted_confidence(scores_df, user_role_coverage, config):
     - core/common: peer_group=0.80, role_cov=0.10, drift=0.10, attributes=0.0
     - residual: attributes=0.80, role_cov=0.10, drift=0.10, peer_group=0.0
     - birthright/tiered_birthright: direct override (1.0 or sub-pop prevalence)
+
+    Note: drift weight is defined but drift_data is always None in the current
+    pipeline. The renormalize path excludes it from the weighted sum. Effective
+    weights are 0.80 peer_group + 0.10 role_cov (renormalized to ~0.89/0.11)
+    for core/common.
     """
     df = scores_df.copy()
     attr_columns, attr_weights = _get_user_attribute_config(config)
