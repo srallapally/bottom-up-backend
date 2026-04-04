@@ -442,6 +442,7 @@ def mine_v2(session_id):
         tiered_birthright_roles=(
             tiered_result["tiered_birthright_roles"] if tiered_result else []
         ),
+        identities=identities,  # CHANGE 2026-04-04: exact per-user tiered residual coverage
     )
     logger.info(
         "Step 6 done: roles=%d residuals=%d  elapsed_ms=%.0f",

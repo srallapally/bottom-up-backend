@@ -14,3 +14,4 @@ protobuf
 # GCP persistence (Cloud Run + GCS + Firestore)
 google-cloud-storage>=2.16,<3.0
 google-cloud-firestore>=2.16,<3.0
+pytest

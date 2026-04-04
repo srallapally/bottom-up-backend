@@ -43,6 +43,7 @@ def build_roles(
         birthright_result: Dict[str, Any],
         config: Optional[Dict[str, Any]] = None,
         tiered_birthright_roles: Optional[List[Dict]] = None,  # CHANGE 2026-04-02
+        identities=None,  # CHANGE 2026-04-04: needed for exact per-user tiered coverage
 ) -> Dict[str, Any]:
     """
     Build role definitions from entitlement clusters with two-tier prevalence.
@@ -182,6 +183,7 @@ def build_roles(
 
     # ---- Step 8: Residuals against expanded core sets ----
     # CHANGE 2026-04-02: Pass tiered_birthright_roles for residual coverage
+    # CHANGE 2026-04-04: Pass identities for exact per-user tiered coverage
     logger.info("Step 8: Computing residual access against core entitlement sets")
     # CHANGE 2026-02-17: Pass user_ids and ent_ids
     residuals = _compute_residuals_v2(
@@ -192,6 +194,7 @@ def build_roles(
         user_memberships=user_memberships,
         birthright_entitlements=list(birthright_ents),
         tiered_birthright_roles=tiered_birthright_roles or [],
+        identities=identities,
     )
 
     # ---- Step 9: Birthright role, summary, stats ----
@@ -562,6 +565,64 @@ def _build_birthright_role(
 # RESIDUAL ACCESS COMPUTATION
 # ============================================================================
 
+def _build_tiered_covered_by_user(
+        tiered_birthright_roles: List[Dict],
+        identities,  # pd.DataFrame with USR_ID as column or index
+) -> Dict[str, set]:
+    """
+    Build exact per-user tiered birthright coverage map.
+
+    Returns Dict[str(user_id), Set[ent_id]] — only users whose attributes
+    match each tiered birthright role's criteria receive its entitlements.
+    Users absent from identities receive no tiered coverage.
+
+    Keys are str(user_id) to match user_memberships key type.
+    """
+    tiered_covered: Dict[str, set] = {}
+
+    if not tiered_birthright_roles or identities is None or identities.empty:
+        return tiered_covered
+
+    # Ensure USR_ID is the index for vectorized filtering
+    if identities.index.name == "USR_ID":
+        id_indexed = identities
+    elif "USR_ID" in identities.columns:
+        id_indexed = identities.set_index("USR_ID")
+    else:
+        logger.warning(
+            "_build_tiered_covered_by_user: identities has no USR_ID column or index; "
+            "tiered residual coverage will be empty (all tiered ents treated as residual)"
+        )
+        return tiered_covered
+
+    missing_cols = []
+    for tbr in tiered_birthright_roles:
+        criteria = tbr["criteria"]  # e.g. {"clinical_nonclinical": "Clinical"}
+        ent_set = set(tbr["entitlements"])
+
+        # Current design: single-attribute criteria only
+        col, val = next(iter(criteria.items()))
+        if col not in id_indexed.columns:
+            missing_cols.append(col)
+            continue
+
+        # Vectorized filter — no per-row loop
+        matching_ids = id_indexed.index[id_indexed[col] == val]
+        for uid in matching_ids:
+            key = str(uid)
+            if key not in tiered_covered:
+                tiered_covered[key] = set()
+            tiered_covered[key].update(ent_set)
+
+    if missing_cols:
+        logger.warning(
+            "_build_tiered_covered_by_user: %d criteria column(s) missing from identities: %s",
+            len(missing_cols), missing_cols,
+        )
+
+    return tiered_covered
+
+
 def _compute_residuals_v2(
         matrix,
         user_ids,
@@ -570,23 +631,24 @@ def _compute_residuals_v2(
         user_memberships,
         birthright_entitlements,
         tiered_birthright_roles=None,
+        identities=None,  # CHANGE 2026-04-04: exact per-user tiered coverage
 ):
     """
     Compute residual access (entitlements not covered by roles, birthright,
     or tiered birthrights).
 
     CHANGE 2026-04-02: Added tiered_birthright_roles to coverage set.
+    CHANGE 2026-04-04: Replaced global tiered entitlement union with exact
+        per-user criteria-based coverage. A user only gets tiered birthright
+        credit for roles whose criteria they actually match. Users missing
+        from identities receive no tiered coverage.
 
     Coverage set per user:
         covered = universal_birthright_ents
-                  ∪ tiered_birthright_ents
+                  ∪ tiered_birthright_ents_matching_this_user
                   ∪ {role core ents for each role user is assigned to}
 
         residuals = user's actual entitlements - covered
-
-    Note: without identities in this function, tiered entitlements are treated
-    as covered for ALL holders (slightly over-generous). The confidence scorer
-    handles precise per-user criteria matching.
     """
     tiered_birthright_roles = tiered_birthright_roles or []
 
@@ -597,10 +659,25 @@ def _compute_residuals_v2(
 
     birthright_set = set(birthright_entitlements)
 
-    # Build global tiered entitlement set
-    tiered_ent_set = set()
-    for role in tiered_birthright_roles:
-        tiered_ent_set.update(role["entitlements"])
+    # Precompute exact per-user tiered coverage once — not inside the loop
+    tiered_covered_by_user = _build_tiered_covered_by_user(
+        tiered_birthright_roles, identities
+    )
+
+    # Diagnostic: log coverage scope
+    if tiered_birthright_roles:
+        if tiered_covered_by_user:
+            matched_pairs = sum(len(v) for v in tiered_covered_by_user.values())
+            logger.info(
+                "Tiered residual coverage: %d users matched, %d user-entitlement pairs covered",
+                len(tiered_covered_by_user), matched_pairs,
+            )
+        else:
+            logger.warning(
+                "Tiered residual coverage: 0 users matched despite %d tiered roles — "
+                "check that identities is available and criteria columns are present",
+                len(tiered_birthright_roles),
+            )
 
     user_idx_map = {uid: i for i, uid in enumerate(user_ids)}
     ent_ids_array = np.array(ent_ids)
@@ -614,7 +691,8 @@ def _compute_residuals_v2(
             core_ents = cluster_to_core.get(cluster_id, set())
             covered_by_roles.update(core_ents)
 
-        total_covered = covered_by_roles | birthright_set | tiered_ent_set
+        user_tiered = tiered_covered_by_user.get(str(user_id), set())
+        total_covered = covered_by_roles | birthright_set | user_tiered
 
         if user_id in user_idx_map:
             u = user_idx_map[user_id]
@@ -633,13 +711,14 @@ def _compute_residuals_v2(
     assigned_users = set(user_memberships.keys())
 
     for user_id in (all_users - assigned_users):
+        user_tiered = tiered_covered_by_user.get(str(user_id), set())
         if user_id in user_idx_map:
             u = user_idx_map[user_id]
             start, end = matrix.indptr[u], matrix.indptr[u + 1]
             user_ents = set(ent_ids_array[matrix.indices[start:end]])
         else:
             user_ents = set()
-        residual_ents = user_ents - birthright_set - tiered_ent_set
+        residual_ents = user_ents - birthright_set - user_tiered
 
         for ent_id in residual_ents:
             residuals.append({"USR_ID": user_id, "entitlement_id": ent_id})
