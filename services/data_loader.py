@@ -114,7 +114,35 @@ def build_user_entitlement_matrix(assignments: pd.DataFrame):
     )
     # Clamp any residual duplicates to 1 (assignments is already deduped,
     # but csr_matrix sums repeated (row, col) pairs during construction).
+
     sparse.data[:] = 1
+
+    # Integrity check 1: NNZ should equal deduplicated assignment rows.
+    # If not, deduplication failed silently somewhere upstream — this is a
+    # data-integrity bug worth surfacing.
+    if sparse.nnz != len(assignments):
+        _logger.warning(
+            "build_user_entitlement_matrix: NNZ mismatch — "
+            "sparse.nnz=%d but len(assignments)=%d; "
+            "check for upstream deduplication failure",
+            sparse.nnz, len(assignments),
+        )
+
+    # Integrity check 2: all stored values must be 1 after the clamp above.
+    # Trivially true given the clamp, but documents the binary invariant.
+    if not np.all(sparse.data == 1):
+        _logger.warning(
+            "build_user_entitlement_matrix: non-binary values detected after clamp; "
+            "sparse.data range [%s, %s]",
+            sparse.data.min(), sparse.data.max(),
+        )
+
+    n_users, n_ents = sparse.shape
+    sparsity = 1.0 - sparse.nnz / (n_users * n_ents) if n_users * n_ents > 0 else float("nan")
+    _logger.info(
+        "build_user_entitlement_matrix: shape=(%d, %d) nnz=%d sparsity=%.2f%%",
+        n_users, n_ents, sparse.nnz, sparsity * 100,
+    )
 
     # CHANGE 2026-02-17: Return sparse + indices, not dense DataFrame
     return sparse, user_cat.categories, ent_cat.categories
